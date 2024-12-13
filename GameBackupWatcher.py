@@ -99,7 +99,7 @@ class BackupHandler(FileSystemEventHandler):
                 self.parent.update_status("Creating a backup....")
                 time.sleep(5)
                 file_name = os.path.basename(file_path)
-                timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+                timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
                 destination_file_name = f"{os.path.splitext(file_name)[0]}_{timestamp}{os.path.splitext(file_name)[1]}"
                 destination_path = os.path.join(self.backup_dir, destination_file_name)
 
@@ -311,7 +311,6 @@ class BackupApp(QWidget):
         if self.watcher_thread:
             self.watcher_thread.stop()
         event.accept()
-
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
