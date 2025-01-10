@@ -7,7 +7,7 @@ import threading
 import time
 import sys
 from datetime import datetime
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget, QCheckBox
 from PyQt5.QtCore import QThread, Qt
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -45,13 +45,14 @@ def save_config(config):
 
 # Handler for file system events to monitor changes in the source directory
 class BackupHandler(FileSystemEventHandler):
-    def __init__(self, backup_dir, timeout, file_list_widget, src_dir, filename_pattern, parent=None):
+    def __init__(self, backup_dir, timeout, file_list_widget, src_dir, filename_pattern, create_date_dir, parent=None):
         super().__init__()
         self.backup_dir = backup_dir
         self.timeout = timeout
         self.file_list_widget = file_list_widget
         self.src_dir = src_dir
         self.filename_pattern = filename_pattern
+        self.create_date_dir = create_date_dir
         self.parent = parent
         self.current_file = None
         self.timer = None
@@ -95,13 +96,24 @@ class BackupHandler(FileSystemEventHandler):
     def backup_next(self):
         if self.current_file:
             file_path = self.current_file
+            timestamp = ""
             try:
                 self.parent.update_status("Creating a backup....")
                 time.sleep(5)
                 file_name = os.path.basename(file_path)
-                timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
+                if self.create_date_dir:
+                    timestamp = datetime.now().strftime("%H-%M")
+                else:
+                    timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
+                
+                date_folder = datetime.now().strftime("%d-%m-%Y") if self.create_date_dir else ""
+
+                backup_path = os.path.join(self.backup_dir, date_folder)
+                if self.create_date_dir and not os.path.exists(backup_path):
+                    os.makedirs(backup_path)
+
                 destination_file_name = f"{os.path.splitext(file_name)[0]}_{timestamp}{os.path.splitext(file_name)[1]}"
-                destination_path = os.path.join(self.backup_dir, destination_file_name)
+                destination_path = os.path.join(backup_path, destination_file_name)
 
                 shutil.copy2(file_path, destination_path)
                 self.parent.update_status(f"Backup created: {destination_file_name}")
@@ -189,7 +201,7 @@ class BackupApp(QWidget):
         layout.addWidget(self.timeout_label)
 
         self.timeout_input = QSpinBox(self)
-        self.timeout_input.setRange(1, 60)
+        self.timeout_input.setRange(1, 9999)
         self.timeout_input.setValue(self.timeout)
         layout.addWidget(self.timeout_input)
 
@@ -198,6 +210,9 @@ class BackupApp(QWidget):
 
         self.filename_pattern_input = QLineEdit(self)
         layout.addWidget(self.filename_pattern_input)
+
+        self.date_folder_checkbox = QCheckBox("Create backup folder with today's date", self)
+        layout.addWidget(self.date_folder_checkbox)
 
         self.start_button = QPushButton("Start Watching", self)
         self.start_button.clicked.connect(self.start_backup_monitoring)
@@ -245,9 +260,10 @@ class BackupApp(QWidget):
         backup_dir = self.dest_input.text()
         timeout = self.timeout_input.value()
         filename_pattern = self.filename_pattern_input.text()
+        create_date_dir = self.date_folder_checkbox.isChecked()
 
         if src_dir and backup_dir and filename_pattern:
-            self.backup_handler = BackupHandler(backup_dir, timeout, self.file_list_widget, src_dir, filename_pattern, self)
+            self.backup_handler = BackupHandler(backup_dir, timeout, self.file_list_widget, src_dir, filename_pattern, create_date_dir, self)
             self.watcher_thread = WatcherThread(self.backup_handler, src_dir)
             self.watcher_thread.start()
             self.monitoring = True
@@ -304,6 +320,10 @@ class BackupApp(QWidget):
         self.update_status(f"Restored {backup_file}. Watching again....")
 
     def add_to_backup_dict(self, destination_file_name, original_file_path):
+        if self.date_folder_checkbox.isChecked():
+            original_dest_file_name = destination_file_name
+            destination_file_name = os.path.join(datetime.now().strftime("%d-%m-%Y"), original_dest_file_name)
+            print(f"{destination_file_name}")
         self.backup_dict[destination_file_name] = original_file_path
         self.file_list_widget.addItem(destination_file_name)
 
