@@ -8,7 +8,7 @@ import time
 import sys
 from datetime import datetime
 from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget, QCheckBox
-from PyQt5.QtCore import QThread, Qt
+from PyQt5.QtCore import QThread, Qt, QTimer, QTime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import json
@@ -158,6 +158,11 @@ class BackupApp(QWidget):
         self.setWindowTitle("Backup Manager")
         self.setGeometry(200, 200, 400, 300)
 
+        # Timer to update the title with the current time
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_title_with_time)
+        self.timer.start(1000)  # Update every second
+
         self.backup_dict = {}
         self.monitoring = False
 
@@ -175,6 +180,11 @@ class BackupApp(QWidget):
         self.dest_input.setText(self.backup_dir)
         self.filename_pattern_input.setText(self.filename_pattern)
         self.timeout_input.setValue(self.timeout)
+
+    def update_title_with_time(self):
+        """Updates the window title with the current time."""
+        current_time = QTime.currentTime().toString("HH:mm:ss")
+        self.setWindowTitle(f"Backup Manager - {current_time}")
 
     def initUI(self):
         layout = QVBoxLayout()
