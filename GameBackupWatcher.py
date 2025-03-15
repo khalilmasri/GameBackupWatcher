@@ -120,7 +120,11 @@ class BackupHandler(FileSystemEventHandler):
 
                 self.parent.add_to_backup_dict(destination_file_name, file_path)
             except Exception as e:
-                self.parent.update_status(f"Error backing up file: {e}")
+                try:
+                    shutil.copytree(file_path, destination_path) 
+                    self.parent.update_status(f"Backup created: {destination_file_name}")
+                except Exception as e:
+                    self.parent.update_status(f"Error backing up file: {e}")
 
 
 class WatcherThread(QThread):
@@ -212,6 +216,7 @@ class BackupApp(QWidget):
         layout.addWidget(self.filename_pattern_input)
 
         self.date_folder_checkbox = QCheckBox("Create backup folder with today's date", self)
+        self.date_folder_checkbox.setChecked(True)
         layout.addWidget(self.date_folder_checkbox)
 
         self.start_button = QPushButton("Start Watching", self)
