@@ -27,13 +27,18 @@ def load_config():
     config_path = get_config_file_path()
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
-            return json.load(f)
+            config = json.load(f)
+            # Ensure keep_on_top defaults to True if not present
+            if 'keep_on_top' not in config:
+                config['keep_on_top'] = True
+            return config
     else:
         return {
             "backup_dir": "",
             "src_dir": "",
             "filename_pattern": "*.sav",
-            "timeout": 5
+            "timeout": 5,
+            "keep_on_top": True
         }
 
 # Function to save the current configuration to the file
@@ -46,6 +51,7 @@ def save_config(config):
 class BackupHandler(FileSystemEventHandler):
     def __init__(self, backup_dir, timeout, file_list_widget, src_dir, filename_pattern, create_date_dir, parent=None):
         super().__init__()
+
         self.backup_dir = backup_dir
         self.timeout = timeout
         self.file_list_widget = file_list_widget
@@ -160,11 +166,11 @@ class BackupApp(QWidget):
         self.backup_dict = {}
         self.monitoring = False
 
-        config = load_config()
-        self.src_dir = config.get("src_dir", "")
-        self.backup_dir = config.get("backup_dir", "")
-        self.filename_pattern = config.get("filename_pattern", "*.sav")
-        self.timeout = config.get("timeout", 5)
+        self.config = load_config()
+        self.src_dir = self.config.get("src_dir", "")
+        self.backup_dir = self.config.get("backup_dir", "")
+        self.filename_pattern = self.config.get("filename_pattern", "*.sav")
+        self.timeout = self.config.get("timeout", 5)
 
         self.initUI()
 
@@ -173,8 +179,28 @@ class BackupApp(QWidget):
         self.filename_pattern_input.setText(self.filename_pattern)
         self.timeout_input.setValue(self.timeout)
 
+        if self.config.get("keep_on_top", True):
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        else:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+
         if self.src_dir and self.backup_dir and self.filename_pattern:
             QTimer.singleShot(500, self.start_backup_monitoring)
+
+    def toggle_on_top(self, state):
+        if state == Qt.Checked:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+            self.log("Window set to stay on top.")
+            self.config['keep_on_top'] = True
+        else:
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            self.log("Window will no longer stay on top.")
+            self.config['keep_on_top'] = False
+
+        save_config(self.config)  # Save current config immediately
+
+        self.show()  # Re-apply flags, required to update window
+
 
     def update_title_with_time(self):
         current_time = QTime.currentTime().toString("HH:mm:ss")
@@ -251,6 +277,11 @@ class BackupApp(QWidget):
         self.clear_log_button.clicked.connect(self.clear_logs)
         layout.addWidget(self.clear_log_button)
 
+        self.keep_on_top_checkbox = QCheckBox("Keep window on top", self)
+        self.keep_on_top_checkbox.setChecked(self.config.get("keep_on_top", True))  # Load default from config
+        self.keep_on_top_checkbox.stateChanged.connect(self.toggle_on_top)
+        layout.addWidget(self.keep_on_top_checkbox)
+
         self.setLayout(layout)
 
         self.backup_handler = None
@@ -296,9 +327,11 @@ class BackupApp(QWidget):
                 "backup_dir": backup_dir,
                 "src_dir": src_dir,
                 "filename_pattern": filename_pattern,
-                "timeout": timeout
+                "timeout": timeout,
+                "keep_on_top": self.keep_on_top_checkbox.isChecked()
             }
             save_config(config)
+            self.config = config
         else:
             self.log("Please select both the source and backup directories and enter a valid filename pattern.")
 
