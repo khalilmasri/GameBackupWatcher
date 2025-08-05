@@ -42,7 +42,6 @@ def save_config(config):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
-
 # Handler for file system events to monitor changes in the source directory
 class BackupHandler(FileSystemEventHandler):
     def __init__(self, backup_dir, timeout, file_list_widget, src_dir, filename_pattern, create_date_dir, parent=None):
@@ -66,13 +65,13 @@ class BackupHandler(FileSystemEventHandler):
 
     def on_moved(self, event):
         self.handle_event(event)
-     
+
     def stop(self):
         self.stop_requested = True
 
     def handle_event(self, event):
         global g_stop_watching
-        if g_stop_watching == True or self.stop_requested == True:
+        if g_stop_watching or self.stop_requested:
             return
         if fnmatch.fnmatch(os.path.basename(event.src_path), self.filename_pattern):
             if event.event_type in {"created", "modified", "moved"}:
@@ -82,7 +81,6 @@ class BackupHandler(FileSystemEventHandler):
         global g_stop_watching
         if self.timeout == 0:
             return
-
         g_stop_watching = True
         time.sleep(self.timeout)
         g_stop_watching = False
@@ -96,18 +94,16 @@ class BackupHandler(FileSystemEventHandler):
     def backup_next(self):
         if self.current_file:
             file_path = self.current_file
-            timestamp = ""
             try:
-                self.parent.update_status("Creating a backup....")
+                self.parent.log("Creating a backup....")
                 time.sleep(5)
                 file_name = os.path.basename(file_path)
                 if self.create_date_dir:
                     timestamp = datetime.now().strftime("%H-%M")
                 else:
                     timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
-                
-                date_folder = datetime.now().strftime("%d-%m-%Y") if self.create_date_dir else ""
 
+                date_folder = datetime.now().strftime("%d-%m-%Y") if self.create_date_dir else ""
                 backup_path = os.path.join(self.backup_dir, date_folder)
                 if self.create_date_dir and not os.path.exists(backup_path):
                     os.makedirs(backup_path)
@@ -116,22 +112,21 @@ class BackupHandler(FileSystemEventHandler):
                 destination_path = os.path.join(backup_path, destination_file_name)
 
                 shutil.copy2(file_path, destination_path)
-                self.parent.update_status(f"Backup created: {destination_file_name}")
-
+                self.parent.log(f"Backup created: {destination_file_name}")
                 self.parent.add_to_backup_dict(destination_file_name, file_path)
             except Exception as e:
                 try:
-                    shutil.copytree(file_path, destination_path) 
-                    self.parent.update_status(f"Backup created: {destination_file_name}")
+                    shutil.copytree(file_path, destination_path)
+                    self.parent.log(f"Backup created: {destination_file_name}")
                 except Exception as e:
-                    self.parent.update_status(f"Error backing up file: {e}")
-
+                    self.parent.log(f"Error backing up file: {e}")
 
 class WatcherThread(QThread):
-    def __init__(self, backup_handler, src_dir):
+    def __init__(self, backup_handler, src_dir, parent=None):
         super().__init__()
         self.backup_handler = backup_handler
         self.src_dir = src_dir
+        self.parent = parent
 
     def run(self):
         self.observer = Observer()
@@ -142,14 +137,14 @@ class WatcherThread(QThread):
     def stop(self):
         if self.observer:
             try:
-                print("Stopping observer...")
+                self.parent.log("Stopping observer...")
                 self.observer.stop()
                 self.observer.join(timeout=5)
-                print("Observer stopped.")
+                self.parent.log("Observer stopped.")
             except Exception as e:
-                print(f"Error stopping observer: {e}")
-        self.quit()  # Quit the thread's event loop
-        self.wait()  # Ensure the thread is fully stopped
+                self.parent.log(f"Error stopping observer: {e}")
+        self.quit()
+        self.wait()
 
 class BackupApp(QWidget):
     def __init__(self):
@@ -158,15 +153,13 @@ class BackupApp(QWidget):
         self.setWindowTitle("Backup Manager")
         self.setGeometry(200, 200, 400, 300)
 
-        # Timer to update the title with the current time
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_title_with_time)
-        self.timer.start(1000)  # Update every second
+        self.timer.start(1000)
 
         self.backup_dict = {}
         self.monitoring = False
 
-        # Load the configuration from the file
         config = load_config()
         self.src_dir = config.get("src_dir", "")
         self.backup_dir = config.get("backup_dir", "")
@@ -175,14 +168,15 @@ class BackupApp(QWidget):
 
         self.initUI()
 
-        # Pre-fill the UI with loaded values
         self.src_input.setText(self.src_dir)
         self.dest_input.setText(self.backup_dir)
         self.filename_pattern_input.setText(self.filename_pattern)
         self.timeout_input.setValue(self.timeout)
 
+        if self.src_dir and self.backup_dir and self.filename_pattern:
+            QTimer.singleShot(500, self.start_backup_monitoring)
+
     def update_title_with_time(self):
-        """Updates the window title with the current time."""
         current_time = QTime.currentTime().toString("HH:mm:ss")
         self.setWindowTitle(f"Backup Manager - {current_time}")
 
@@ -216,7 +210,6 @@ class BackupApp(QWidget):
 
         self.timeout_input = QSpinBox(self)
         self.timeout_input.setRange(1, 9999)
-        self.timeout_input.setValue(self.timeout)
         layout.addWidget(self.timeout_input)
 
         self.filename_pattern_label = QLabel("Enter the filename or pattern (e.g., *.sav):")
@@ -238,6 +231,8 @@ class BackupApp(QWidget):
         self.stop_button.setEnabled(False)
         layout.addWidget(self.stop_button)
 
+        self.log_label = QLabel("Backups:")
+        layout.addWidget(self.log_label)
         self.file_list_widget = QListWidget(self)
         layout.addWidget(self.file_list_widget)
 
@@ -245,20 +240,31 @@ class BackupApp(QWidget):
         self.restore_button.clicked.connect(self.restore_backup)
         layout.addWidget(self.restore_button)
 
-        # Add a label for showing the latest status
-        self.status_label = QLabel("Status: Ready")
-        self.status_label.setAlignment(Qt.AlignLeft)
-        layout.addWidget(self.status_label)
+        self.log_label = QLabel("Logs:")
+        layout.addWidget(self.log_label)
+
+        self.log_widget = QListWidget(self)
+        self.log_widget.setMinimumHeight(100)
+        layout.addWidget(self.log_widget)
+
+        self.clear_log_button = QPushButton("Clear Logs", self)
+        self.clear_log_button.clicked.connect(self.clear_logs)
+        layout.addWidget(self.clear_log_button)
 
         self.setLayout(layout)
 
         self.backup_handler = None
         self.watcher_thread = None
-        
-    def update_status(self, message):
-        """Update the status label with the latest message."""
-        print(f"{message}")
-        self.status_label.setText(f"Status: {message}")
+
+    def log(self, message):
+        timestamp = datetime.now().strftime("[%H:%M:%S]")
+        full_msg = f"{timestamp} {message}"
+        self.log_widget.addItem(full_msg)
+        self.log_widget.scrollToBottom()
+        print(full_msg)
+
+    def clear_logs(self):
+        self.log_widget.clear()
 
     def select_src_directory(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Directory")
@@ -279,14 +285,13 @@ class BackupApp(QWidget):
 
         if src_dir and backup_dir and filename_pattern:
             self.backup_handler = BackupHandler(backup_dir, timeout, self.file_list_widget, src_dir, filename_pattern, create_date_dir, self)
-            self.watcher_thread = WatcherThread(self.backup_handler, src_dir)
+            self.watcher_thread = WatcherThread(self.backup_handler, src_dir, self)
             self.watcher_thread.start()
             self.monitoring = True
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
-            self.update_status("Monitoring started.")
+            self.log("Monitoring started.")
 
-            # Save updated configuration to file
             config = {
                 "backup_dir": backup_dir,
                 "src_dir": src_dir,
@@ -294,22 +299,21 @@ class BackupApp(QWidget):
                 "timeout": timeout
             }
             save_config(config)
-
         else:
-            self.update_status("Please select both the source and backup directories and enter a valid filename pattern.")
+            self.log("Please select both the source and backup directories and enter a valid filename pattern.")
 
     def stop_backup_monitoring(self):
         if self.watcher_thread:
             try:
-                print("1. Attempting to stop watcher thread...")
+                self.log("Attempting to stop watcher thread...")
                 self.watcher_thread.stop()
-                print("2. Watcher thread stopped.")
+                self.log("Watcher thread stopped.")
                 self.monitoring = False
                 self.start_button.setEnabled(True)
                 self.stop_button.setEnabled(False)
-                print("Monitoring stopped.")
+                self.log("Monitoring stopped.")
             except Exception as e:
-                print(f"Error stopping watcher thread: {e}")
+                self.log(f"Error stopping watcher thread: {e}")
 
     def restore_backup(self):
         global g_stop_watching
@@ -321,26 +325,27 @@ class BackupApp(QWidget):
                 original_file = self.backup_dict[backup_file]
                 try:
                     full_path = os.path.join(self.dest_input.text(), backup_file)
-                    print(f"Restoring {backup_file} to {original_file}")
+                    self.log(f"Restoring {backup_file} to {original_file}")
                     shutil.copy2(full_path, original_file)
-                   
+                    self.log(f"Restored {backup_file}. Watching again....")
+                    time.sleep(1)
                 except Exception as e:
-                    self.update_status(f"Error restoring file: {e}")
+                    self.log(f"Error restoring file: {e}")
             else:
-                self.update_status("No backup found for the selected file.")
+                self.log("No backup found for the selected file.")
         else:
-            self.update_status("Please select a backup file to restore.")
-        time.sleep(5)
+            self.log("Please select a backup file to restore.")
         g_stop_watching = False
-        self.update_status(f"Restored {backup_file}. Watching again....")
+
 
     def add_to_backup_dict(self, destination_file_name, original_file_path):
         if self.date_folder_checkbox.isChecked():
             original_dest_file_name = destination_file_name
             destination_file_name = os.path.join(datetime.now().strftime("%d-%m-%Y"), original_dest_file_name)
-            print(f"{destination_file_name}")
+            self.log(f"{destination_file_name}")
         self.backup_dict[destination_file_name] = original_file_path
         self.file_list_widget.addItem(destination_file_name)
+        self.file_list_widget.scrollToBottom()
 
     def closeEvent(self, event):
         if self.watcher_thread:
