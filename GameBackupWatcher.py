@@ -7,7 +7,7 @@ import threading
 import time
 import sys
 from datetime import datetime
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget, QCheckBox
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget, QCheckBox, QAbstractItemView
 from PyQt5.QtCore import QThread, Qt, QTimer, QTime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -156,8 +156,10 @@ class BackupApp(QWidget):
     def __init__(self):
         super().__init__()
 
+        self.log_file_path = os.path.join(os.getcwd(), "backup_manager.log")
+
         self.setWindowTitle("Backup Manager")
-        self.setGeometry(200, 200, 400, 300)
+        self.setGeometry(200, 200, 400, 817)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_title_with_time)
@@ -186,6 +188,7 @@ class BackupApp(QWidget):
 
         if self.src_dir and self.backup_dir and self.filename_pattern:
             QTimer.singleShot(500, self.start_backup_monitoring)
+
 
     def toggle_on_top(self, state):
         if state == Qt.Checked:
@@ -290,9 +293,29 @@ class BackupApp(QWidget):
     def log(self, message):
         timestamp = datetime.now().strftime("[%H:%M:%S]")
         full_msg = f"{timestamp} {message}"
+
+        # Add the message to the GUI log list
         self.log_widget.addItem(full_msg)
-        self.log_widget.scrollToBottom()
+
+        # Keep only the last 10 log messages visible in the widget
+        while self.log_widget.count() > 10:
+            self.log_widget.takeItem(0)
+
+        # Scroll to the newest item
+        last_index = self.log_widget.count() - 1
+        if last_index >= 0:
+            self.log_widget.scrollToItem(self.log_widget.item(last_index), QAbstractItemView.PositionAtBottom)
+
+        # Append the log message to the log file
+        try:
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(full_msg + "\n")
+        except Exception as e:
+            print(f"Failed to write log to file: {e}")
+
+        # Also print to console
         print(full_msg)
+
 
     def clear_logs(self):
         self.log_widget.clear()
