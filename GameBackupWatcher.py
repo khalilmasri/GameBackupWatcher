@@ -157,6 +157,8 @@ class BackupApp(QWidget):
         super().__init__()
 
         self.log_file_path = os.path.join(os.getcwd(), "backup_manager.log")
+        with open(self.log_file_path, 'w') as f:
+            f.write("=== Backup Manager Started ===\n")
 
         self.setWindowTitle("Backup Manager")
         self.setGeometry(200, 200, 400, 817)
@@ -308,7 +310,8 @@ class BackupApp(QWidget):
 
         # Append the log message to the log file
         try:
-            with open(self.log_file_path, "a", encoding="utf-8") as f:
+            # Append to log file
+            with open(self.log_file_path, 'a') as f:
                 f.write(full_msg + "\n")
         except Exception as e:
             print(f"Failed to write log to file: {e}")
