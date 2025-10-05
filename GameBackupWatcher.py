@@ -7,8 +7,12 @@ import threading
 import time
 import sys
 from datetime import datetime
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget, QCheckBox, QAbstractItemView
-from PyQt5.QtCore import QThread, Qt, QTimer, QTime
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel,
+    QLineEdit, QSpinBox, QListWidget, QCheckBox, QAbstractItemView, QListWidgetItem
+)
+from PyQt5.QtCore import QThread, Qt, QTimer, QTime, QEvent, QPoint
+from PyQt5.QtGui import QPixmap, QCursor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import json
@@ -28,7 +32,6 @@ def load_config():
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             config = json.load(f)
-            # Ensure keep_on_top defaults to True if not present
             if 'keep_on_top' not in config:
                 config['keep_on_top'] = True
             return config
@@ -41,17 +44,16 @@ def load_config():
             "keep_on_top": True
         }
 
-# Function to save the current configuration to the file
+# Function to save configuration to the file
 def save_config(config):
     config_path = get_config_file_path()
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=4)
 
-# Handler for file system events to monitor changes in the source directory
+# Handler for file system events
 class BackupHandler(FileSystemEventHandler):
     def __init__(self, backup_dir, timeout, file_list_widget, src_dir, filename_pattern, create_date_dir, parent=None):
         super().__init__()
-
         self.backup_dir = backup_dir
         self.timeout = timeout
         self.file_list_widget = file_list_widget
@@ -60,7 +62,6 @@ class BackupHandler(FileSystemEventHandler):
         self.create_date_dir = create_date_dir
         self.parent = parent
         self.current_file = None
-        self.timer = None
         self.stop_requested = False
 
     def on_modified(self, event):
@@ -117,15 +118,29 @@ class BackupHandler(FileSystemEventHandler):
                 destination_file_name = f"{os.path.splitext(file_name)[0]}_{timestamp}{os.path.splitext(file_name)[1]}"
                 destination_path = os.path.join(backup_path, destination_file_name)
 
-                shutil.copy2(file_path, destination_path)
+                # Try copying file
+                if os.path.isfile(file_path):
+                    shutil.copy2(file_path, destination_path)
+                else:
+                    # If folder, make dir version
+                    destination_path = os.path.join(backup_path, f"{os.path.splitext(file_name)[0]}_{timestamp}")
+                    shutil.copytree(file_path, destination_path, dirs_exist_ok=True)
+
                 self.parent.log(f"Backup created: {destination_file_name}")
-                self.parent.add_to_backup_dict(destination_file_name, file_path)
+
+                # Take screenshot
+                screenshot_path = os.path.join(backup_path, f"{os.path.splitext(destination_file_name)[0]}.png")
+                screen = QApplication.primaryScreen()
+                if screen:
+                    screenshot = screen.grabWindow(0)
+                    screenshot.save(screenshot_path, "PNG")
+                    self.parent.log(f"Screenshot saved: {screenshot_path}")
+
+                # Add to list with screenshot
+                self.parent.add_to_backup_dict(destination_file_name, file_path, screenshot_path)
+
             except Exception as e:
-                try:
-                    shutil.copytree(file_path, destination_path)
-                    self.parent.log(f"Backup created: {destination_file_name}")
-                except Exception as e:
-                    self.parent.log(f"Error backing up file: {e}")
+                self.parent.log(f"Error backing up file: {e}")
 
 class WatcherThread(QThread):
     def __init__(self, backup_handler, src_dir, parent=None):
@@ -191,6 +206,11 @@ class BackupApp(QWidget):
         if self.src_dir and self.backup_dir and self.filename_pattern:
             QTimer.singleShot(500, self.start_backup_monitoring)
 
+        # Screenshot preview label
+        self.preview_label = QLabel(self)
+        self.preview_label.setWindowFlags(Qt.ToolTip)
+        self.preview_label.hide()
+        self.file_list_widget.installEventFilter(self)
 
     def toggle_on_top(self, state):
         if state == Qt.Checked:
@@ -201,11 +221,8 @@ class BackupApp(QWidget):
             self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
             self.log("Window will no longer stay on top.")
             self.config['keep_on_top'] = False
-
-        save_config(self.config)  # Save current config immediately
-
-        self.show()  # Re-apply flags, required to update window
-
+        save_config(self.config)
+        self.show()
 
     def update_title_with_time(self):
         current_time = QTime.currentTime().toString("HH:mm:ss")
@@ -283,7 +300,7 @@ class BackupApp(QWidget):
         layout.addWidget(self.clear_log_button)
 
         self.keep_on_top_checkbox = QCheckBox("Keep window on top", self)
-        self.keep_on_top_checkbox.setChecked(self.config.get("keep_on_top", True))  # Load default from config
+        self.keep_on_top_checkbox.setChecked(self.config.get("keep_on_top", True))
         self.keep_on_top_checkbox.stateChanged.connect(self.toggle_on_top)
         layout.addWidget(self.keep_on_top_checkbox)
 
@@ -295,30 +312,18 @@ class BackupApp(QWidget):
     def log(self, message):
         timestamp = datetime.now().strftime("[%H:%M:%S]")
         full_msg = f"{timestamp} {message}"
-
-        # Add the message to the GUI log list
         self.log_widget.addItem(full_msg)
-
-        # Keep only the last 10 log messages visible in the widget
         while self.log_widget.count() > 10:
             self.log_widget.takeItem(0)
-
-        # Scroll to the newest item
         last_index = self.log_widget.count() - 1
         if last_index >= 0:
             self.log_widget.scrollToItem(self.log_widget.item(last_index), QAbstractItemView.PositionAtBottom)
-
-        # Append the log message to the log file
         try:
-            # Append to log file
             with open(self.log_file_path, 'a') as f:
                 f.write(full_msg + "\n")
         except Exception as e:
             print(f"Failed to write log to file: {e}")
-
-        # Also print to console
         print(full_msg)
-
 
     def clear_logs(self):
         self.log_widget.clear()
@@ -385,7 +390,16 @@ class BackupApp(QWidget):
                 try:
                     full_path = os.path.join(self.dest_input.text(), backup_file)
                     self.log(f"Restoring {backup_file} to {original_file}")
-                    shutil.copy2(full_path, original_file)
+
+                    if os.path.isfile(full_path):
+                        # Restore single file
+                        shutil.copy2(full_path, original_file)
+                    elif os.path.isdir(full_path):
+                        # Restore whole directory
+                        if os.path.exists(original_file):
+                            shutil.rmtree(original_file)  # remove old folder
+                        shutil.copytree(full_path, original_file)
+
                     self.log(f"Restored {backup_file}. Watching again....")
                     time.sleep(1)
                 except Exception as e:
@@ -397,14 +411,44 @@ class BackupApp(QWidget):
         g_stop_watching = False
 
 
-    def add_to_backup_dict(self, destination_file_name, original_file_path):
+    def add_to_backup_dict(self, destination_file_name, original_file_path, screenshot_path=None):
         if self.date_folder_checkbox.isChecked():
             original_dest_file_name = destination_file_name
             destination_file_name = os.path.join(datetime.now().strftime("%d-%m-%Y"), original_dest_file_name)
             self.log(f"{destination_file_name}")
+
+        item = QListWidgetItem(destination_file_name)
+        if screenshot_path:
+            item.setData(Qt.UserRole, screenshot_path)
         self.backup_dict[destination_file_name] = original_file_path
-        self.file_list_widget.addItem(destination_file_name)
+        self.file_list_widget.addItem(item)
         self.file_list_widget.scrollToBottom()
+
+    def eventFilter(self, source, event):
+        if source == self.file_list_widget:
+            if event.type() == QEvent.ToolTip:  # Hovering triggers tooltip
+                item = source.itemAt(event.pos())
+                if item:
+                    screenshot_path = item.data(Qt.UserRole)
+                    if screenshot_path and os.path.exists(screenshot_path):
+                        pixmap = QPixmap(screenshot_path).scaled(300, 200, Qt.KeepAspectRatio)
+                        self.preview_label.setPixmap(pixmap)
+                        self.preview_label.move(QCursor.pos() + QPoint(10, 10))
+                        self.preview_label.show()
+                        return True
+                self.preview_label.hide()
+
+            elif event.type() == QEvent.MouseMove:  # Moving inside the widget
+                item = source.itemAt(event.pos())
+                if not item:  # If no item under cursor, hide preview
+                    self.preview_label.hide()
+
+            elif event.type() == QEvent.Leave:  # Leaving the widget
+                self.preview_label.hide()
+
+        return super().eventFilter(source, event)
+
+
 
     def closeEvent(self, event):
         if self.watcher_thread:
