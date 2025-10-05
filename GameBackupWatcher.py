@@ -5,9 +5,9 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QFileDialog, QLabel, QLineEdit, QSpinBox, QCheckBox, 
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
-    QListWidget
+    QListWidget, QStackedWidget
 )
-from PyQt5.QtCore import Qt, QObject, pyqtSignal
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QSize
 from PyQt5.QtGui import QPixmap
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -35,30 +35,52 @@ def save_config(config):
     with open(path, 'w') as f:
         json.dump(config, f, indent=4)
 
+# ---------------- Image Overlay ---------------- #
+class ImageOverlay(QWidget):
+    def __init__(self, parent, img_path):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet("background-color: rgba(0, 0, 0, 180);")
+        self.setGeometry(parent.rect())   # cover parent only
+
+        # Centered image
+        self.label = QLabel(self)
+        pixmap = QPixmap(img_path)
+        if not pixmap.isNull():
+            scaled = pixmap.scaled(600, 450, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.label.setPixmap(scaled)
+            self.label.adjustSize()
+
+            x = (self.width() - self.label.width()) // 2
+            y = (self.height() - self.label.height()) // 2
+            self.label.move(x, y)
+
+    def mousePressEvent(self, event):
+        self.close()
+
 # ---------------- Hover Thumbnail ---------------- #
 class HoverThumbnail(QLabel):
-    def __init__(self, img_path):
+    def __init__(self, img_path, main_window=None):
         super().__init__()
         self.img_path = img_path
-        self.setFixedSize(64, 48)
-        self.setScaledContents(True)
+        self.main_window = main_window
+
+        self.setFixedSize(48,48)
+
         if os.path.exists(img_path):
             pixmap = QPixmap(img_path)
-            self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            pixmap = pixmap.scaled(48, 48, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self.setPixmap(pixmap)
         else:
-            self.setText("No Img")
+            self.setText("️⛔️")
 
-    def enterEvent(self, event):
-        if os.path.exists(self.img_path):
-            pixmap = QPixmap(self.img_path)
-            self.setPixmap(pixmap.scaled(256, 192, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            self.setFixedSize(256, 192)
 
-    def leaveEvent(self, event):
-        if os.path.exists(self.img_path):
-            pixmap = QPixmap(self.img_path)
-            self.setPixmap(pixmap.scaled(64, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            self.setFixedSize(64, 48)
+    def mousePressEvent(self, event):
+        if os.path.exists(self.img_path) and self.main_window:
+            overlay = ImageOverlay(self.main_window, self.img_path)
+            overlay.show()
+            overlay.raise_()
 
 # ---------------- Backup Handler ---------------- #
 class BackupHandler(QObject, FileSystemEventHandler):
@@ -69,8 +91,6 @@ class BackupHandler(QObject, FileSystemEventHandler):
         self.parent = parent
         self.backup_dir = backup_dir
         self.timeout = int(timeout)
-        self.timeout_wait_thread = threading.Thread(target=self.wait_for_next_timeout)
-        self.timeout_wait_thread.start()
         self.src_dir = src_dir
         self.filename_pattern = filename_pattern
         self.create_date_dir = create_date_dir
@@ -79,6 +99,7 @@ class BackupHandler(QObject, FileSystemEventHandler):
     def wait_for_next_timeout(self):
         global g_stop_watching
         if self.timeout == 0:
+            g_stop_watching = False
             return
         g_stop_watching = True
         time.sleep(self.timeout)
@@ -125,12 +146,12 @@ class BackupHandler(QObject, FileSystemEventHandler):
 
     def backup_file(self, file_path):
         self.parent.log("Detected change, backing up...")
+        global g_stop_watching
         if not os.path.exists(file_path):
+            g_stop_watching = False
             return
 
         try:
-            # Wait until the file/folder stops changing
-            self.wait_for_stable_file(file_path, wait_time=3, retries=3)
 
             file_name = os.path.basename(file_path)
             timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
@@ -140,6 +161,19 @@ class BackupHandler(QObject, FileSystemEventHandler):
 
             destination_file_name = f"{file_name}_{timestamp}"
             destination_path = os.path.join(backup_path, destination_file_name)
+
+            # Take screenshot of main monitor
+            time.sleep(0.5)
+            screenshot_path = destination_path + ".png"
+            try:
+                from PIL import ImageGrab
+                screenshot = ImageGrab.grab()
+                screenshot.save(screenshot_path)
+            except Exception:
+                screenshot_path = None
+
+            # Wait until the file/folder stops changing
+            self.wait_for_stable_file(file_path, wait_time=1, retries=3)
 
             if os.path.isfile(file_path):
                 shutil.copy2(file_path, destination_path)
@@ -151,21 +185,12 @@ class BackupHandler(QObject, FileSystemEventHandler):
                     self.parent.log(f"Unknown file type: {file_path}")
                 return
 
-            # Optional screenshot of main monitor
-            screenshot_path = destination_path + ".png"
-            try:
-                from PIL import ImageGrab
-                screenshot = ImageGrab.grab()
-                screenshot.save(screenshot_path)
-            except Exception:
-                screenshot_path = None
-
             # Emit signal to safely update GUI
             if hasattr(self, "backup_done"):
                 self.backup_done.emit(destination_file_name, file_path, screenshot_path)
             if self.parent and hasattr(self.parent, "log"):
                 self.parent.log(f"Backup created: {destination_file_name}")
-
+                self.wait_for_next_timeout()
         except PermissionError:
             if self.parent and hasattr(self.parent, "log"):
                 self.parent.log(f"Permission denied: {file_path}")
@@ -173,7 +198,6 @@ class BackupHandler(QObject, FileSystemEventHandler):
             if self.parent and hasattr(self.parent, "log"):
                 self.parent.log(f"Error backing up {file_path}: {e}")
         
-        g_stop_watching = False
 
 # ---------------- Watcher Thread ---------------- #
 class WatcherThread(threading.Thread):
@@ -204,9 +228,15 @@ class BackupApp(QWidget):
         self.backup_dict = {}
         self.handler = None
         self.watcher_thread = None
+        self.at_top = False
 
         self.initUI()
         self.load_previous_backups()
+
+        # Start watching automatically if directories are set
+        if self.src_input.text() and self.dest_input.text():
+            self.start_backup_monitoring()
+
 
     def initUI(self):
         main_layout = QHBoxLayout(self)
@@ -264,7 +294,12 @@ class BackupApp(QWidget):
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["Backuped Filename", "Date", "Screenshot", "Restore"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+        # make table read-only and not selectable
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setFocusPolicy(Qt.NoFocus)
+
         left_layout.addWidget(self.table)
         main_layout.addLayout(left_layout, 3)
 
@@ -290,16 +325,37 @@ class BackupApp(QWidget):
         if folder: self.dest_input.setText(folder)
 
     def add_backup_to_table(self, filename, original_file, screenshot_path, date_str=None):
-        row = self.table.rowCount()
+        if self.at_top:
+            row = 0
+        else:
+            row = self.table.rowCount()
+
         self.table.insertRow(row)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+
         self.table.setItem(row, 0, QTableWidgetItem(filename))
         self.table.setItem(row, 1, QTableWidgetItem(date_str or datetime.now().strftime("%d-%m-%Y %H:%M:%S")))
-        thumb = HoverThumbnail(screenshot_path)
+
+        # Load thumbnail
+        thumb = HoverThumbnail(screenshot_path, main_window=self)
+        # Set row height and column width to match the image
+        if thumb.pixmap() is not None:
+            pixmap_size = thumb.pixmap().size()
+        else:
+            pixmap_size = QSize(48, 48)
+        self.table.setRowHeight(row, 48)
+        self.table.setColumnWidth(2, 48)
+
+        # Put label directly in cell
         self.table.setCellWidget(row, 2, thumb)
+
+        # Restore button
         btn_restore = QPushButton("Restore")
         btn_restore.clicked.connect(lambda _, f=filename: self.restore_backup(f))
         self.table.setCellWidget(row, 3, btn_restore)
+
         self.backup_dict[filename] = original_file
+
 
     def start_backup_monitoring(self):
         src = self.src_input.text()
@@ -397,18 +453,19 @@ class BackupApp(QWidget):
 
 
     def load_previous_backups(self):
-        """Scan backup directory and populate table with backups inside date folders."""
+        """Scan backup directory and populate table with backups in descending order (newest first)."""
         dest = self.config.get("backup_dir", "")
         if not dest or not os.path.exists(dest):
             return
 
-        # Iterate over date folders
+        all_backups = []
+
+        # Collect all backups from all date folders
         for date_folder in os.listdir(dest):
             date_folder_path = os.path.join(dest, date_folder)
             if not os.path.isdir(date_folder_path):
                 continue  # skip files at top level
 
-            # Iterate over backups inside the date folder (including timestamped folders)
             for backup_name in os.listdir(date_folder_path):
                 backup_path = os.path.join(date_folder_path, backup_name)
 
@@ -416,15 +473,18 @@ class BackupApp(QWidget):
                 if backup_name.endswith(".png"):
                     continue
 
-                # Determine creation/modification datetime
-                backup_datetime = datetime.fromtimestamp(os.path.getmtime(backup_path))
-                date_str = backup_datetime.strftime("%d-%m-%Y %H:%M:%S")
+                backup_datetime = os.path.getmtime(backup_path)
+                all_backups.append((backup_datetime, backup_name, backup_path, backup_path + ".png"))
 
-                # Screenshot path (optional)
-                screenshot_path = backup_path + ".png"
+        # Sort all backups globally by timestamp descending (newest first)
+        all_backups.sort(key=lambda x: x[0], reverse=True)
 
-                # Add to table
-                self.add_backup_to_table(backup_name, backup_path, screenshot_path, date_str)
+        # Add sorted backups to the table
+        for timestamp, backup_name, backup_path, screenshot_path in all_backups:
+            date_str = datetime.fromtimestamp(timestamp).strftime("%d-%m-%Y %H:%M:%S")
+            self.add_backup_to_table(backup_name, backup_path, screenshot_path, date_str)
+
+        self.at_top = True
 
 
 if __name__ == "__main__":
