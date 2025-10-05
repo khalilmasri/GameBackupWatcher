@@ -1,67 +1,88 @@
 #!/usr/bin/env python3
-
-import os
-import shutil
-import fnmatch
-import threading
-import time
-import sys
+import os, sys, shutil, fnmatch, threading, time, json
 from datetime import datetime
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QLineEdit, QSpinBox, QListWidget, QCheckBox, QAbstractItemView
-from PyQt5.QtCore import QThread, Qt, QTimer, QTime
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
+    QFileDialog, QLabel, QLineEdit, QSpinBox, QCheckBox, 
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
+    QListWidget
+)
+from PyQt5.QtCore import Qt, QObject, pyqtSignal
+from PyQt5.QtGui import QPixmap
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-import json
+from PIL import ImageGrab
 
+# ---------------- Global ---------------- #
 g_stop_watching = False
 
-# Function to get the path to the configuration file
+# ---------------- Config ---------------- #
 def get_config_file_path():
     if os.name == 'nt':  # Windows
         return os.path.join(os.environ['USERPROFILE'], 'Documents', 'backupwatcher.json')
-    else:  # Linux
+    else:
         return os.path.expanduser('~/backupwatcher.json')
 
-# Function to load configuration from the file
 def load_config():
-    config_path = get_config_file_path()
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-            # Ensure keep_on_top defaults to True if not present
-            if 'keep_on_top' not in config:
-                config['keep_on_top'] = True
-            return config
-    else:
-        return {
-            "backup_dir": "",
-            "src_dir": "",
-            "filename_pattern": "*.sav",
-            "timeout": 5,
-            "keep_on_top": True
-        }
+    path = get_config_file_path()
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    return {"backup_dir": "", "src_dir": "", "filename_pattern": "*.sav", "timeout": 5, "keep_on_top": True}
 
-# Function to save the current configuration to the file
 def save_config(config):
-    config_path = get_config_file_path()
-    with open(config_path, 'w') as f:
+    path = get_config_file_path()
+    with open(path, 'w') as f:
         json.dump(config, f, indent=4)
 
-# Handler for file system events to monitor changes in the source directory
-class BackupHandler(FileSystemEventHandler):
-    def __init__(self, backup_dir, timeout, file_list_widget, src_dir, filename_pattern, create_date_dir, parent=None):
+# ---------------- Hover Thumbnail ---------------- #
+class HoverThumbnail(QLabel):
+    def __init__(self, img_path):
         super().__init__()
+        self.img_path = img_path
+        self.setFixedSize(64, 48)
+        self.setScaledContents(True)
+        if os.path.exists(img_path):
+            pixmap = QPixmap(img_path)
+            self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.setText("No Img")
 
+    def enterEvent(self, event):
+        if os.path.exists(self.img_path):
+            pixmap = QPixmap(self.img_path)
+            self.setPixmap(pixmap.scaled(256, 192, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.setFixedSize(256, 192)
+
+    def leaveEvent(self, event):
+        if os.path.exists(self.img_path):
+            pixmap = QPixmap(self.img_path)
+            self.setPixmap(pixmap.scaled(64, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.setFixedSize(64, 48)
+
+# ---------------- Backup Handler ---------------- #
+class BackupHandler(QObject, FileSystemEventHandler):
+    backup_done = pyqtSignal(str, str, str)  # filename, original path, screenshot
+
+    def __init__(self, parent, backup_dir, timeout, src_dir, filename_pattern, create_date_dir):
+        super().__init__()
+        self.parent = parent
         self.backup_dir = backup_dir
-        self.timeout = timeout
-        self.file_list_widget = file_list_widget
+        self.timeout = int(timeout)
+        self.timeout_wait_thread = threading.Thread(target=self.wait_for_next_timeout)
+        self.timeout_wait_thread.start()
         self.src_dir = src_dir
         self.filename_pattern = filename_pattern
         self.create_date_dir = create_date_dir
-        self.parent = parent
-        self.current_file = None
-        self.timer = None
         self.stop_requested = False
+
+    def wait_for_next_timeout(self):
+        global g_stop_watching
+        if self.timeout == 0:
+            return
+        g_stop_watching = True
+        time.sleep(self.timeout)
+        g_stop_watching = False
 
     def on_modified(self, event):
         self.handle_event(event)
@@ -75,343 +96,338 @@ class BackupHandler(FileSystemEventHandler):
     def stop(self):
         self.stop_requested = True
 
+    def wait_for_stable_file(self, path, wait_time=1, retries=3):
+        stable_count = 0
+        last_size = -1
+        while stable_count < retries:
+            if os.path.isfile(path):
+                size = os.path.getsize(path)
+            elif os.path.isdir(path):
+                size = sum(os.path.getsize(os.path.join(dp, f)) for dp, dn, filenames in os.walk(path) for f in filenames)
+            else:
+                break
+            if size == last_size:
+                stable_count += 1
+            else:
+                stable_count = 0
+                last_size = size
+            time.sleep(wait_time)
+
     def handle_event(self, event):
         global g_stop_watching
-        if g_stop_watching or self.stop_requested:
+        if g_stop_watching:
+            return
+        if self.stop_requested or not os.path.exists(event.src_path):
             return
         if fnmatch.fnmatch(os.path.basename(event.src_path), self.filename_pattern):
-            if event.event_type in {"created", "modified", "moved"}:
-                self.backup_file(event.src_path)
-
-    def wait_for_next_timeout(self):
-        global g_stop_watching
-        if self.timeout == 0:
-            return
-        g_stop_watching = True
-        time.sleep(self.timeout)
-        g_stop_watching = False
+            g_stop_watching = True
+            threading.Thread(target=self.backup_file, args=(event.src_path,), daemon=True).start()
 
     def backup_file(self, file_path):
-        self.current_file = file_path
-        self.backup_next()
-        thread = threading.Thread(target=self.wait_for_next_timeout)
-        thread.start()
+        self.parent.log("Detected change, backing up...")
+        if not os.path.exists(file_path):
+            return
 
-    def backup_next(self):
-        if self.current_file:
-            file_path = self.current_file
-            try:
-                self.parent.log("Creating a backup....")
-                time.sleep(5)
-                file_name = os.path.basename(file_path)
-                if self.create_date_dir:
-                    timestamp = datetime.now().strftime("%H-%M")
-                else:
-                    timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M")
+        try:
+            # Wait until the file/folder stops changing
+            self.wait_for_stable_file(file_path, wait_time=3, retries=3)
 
-                date_folder = datetime.now().strftime("%d-%m-%Y") if self.create_date_dir else ""
-                backup_path = os.path.join(self.backup_dir, date_folder)
-                if self.create_date_dir and not os.path.exists(backup_path):
-                    os.makedirs(backup_path)
+            file_name = os.path.basename(file_path)
+            timestamp = datetime.now().strftime("%d-%m-%Y_%H-%M-%S")
+            date_folder = datetime.now().strftime("%d-%m-%Y") if self.create_date_dir else ""
+            backup_path = os.path.join(self.backup_dir, date_folder)
+            os.makedirs(backup_path, exist_ok=True)
 
-                destination_file_name = f"{os.path.splitext(file_name)[0]}_{timestamp}{os.path.splitext(file_name)[1]}"
-                destination_path = os.path.join(backup_path, destination_file_name)
+            destination_file_name = f"{file_name}_{timestamp}"
+            destination_path = os.path.join(backup_path, destination_file_name)
 
+            if os.path.isfile(file_path):
                 shutil.copy2(file_path, destination_path)
-                self.parent.log(f"Backup created: {destination_file_name}")
-                self.parent.add_to_backup_dict(destination_file_name, file_path)
-            except Exception as e:
-                try:
-                    shutil.copytree(file_path, destination_path)
-                    self.parent.log(f"Backup created: {destination_file_name}")
-                except Exception as e:
-                    self.parent.log(f"Error backing up file: {e}")
+            elif os.path.isdir(file_path):
+                # Safe copy for folders (merge if already exists)
+                shutil.copytree(file_path, destination_path, dirs_exist_ok=True)
+            else:
+                if self.parent and hasattr(self.parent, "log"):
+                    self.parent.log(f"Unknown file type: {file_path}")
+                return
 
-class WatcherThread(QThread):
-    def __init__(self, backup_handler, src_dir, parent=None):
-        super().__init__()
-        self.backup_handler = backup_handler
+            # Optional screenshot of main monitor
+            screenshot_path = destination_path + ".png"
+            try:
+                from PIL import ImageGrab
+                screenshot = ImageGrab.grab()
+                screenshot.save(screenshot_path)
+            except Exception:
+                screenshot_path = None
+
+            # Emit signal to safely update GUI
+            if hasattr(self, "backup_done"):
+                self.backup_done.emit(destination_file_name, file_path, screenshot_path)
+            if self.parent and hasattr(self.parent, "log"):
+                self.parent.log(f"Backup created: {destination_file_name}")
+
+        except PermissionError:
+            if self.parent and hasattr(self.parent, "log"):
+                self.parent.log(f"Permission denied: {file_path}")
+        except Exception as e:
+            if self.parent and hasattr(self.parent, "log"):
+                self.parent.log(f"Error backing up {file_path}: {e}")
+        
+        g_stop_watching = False
+
+# ---------------- Watcher Thread ---------------- #
+class WatcherThread(threading.Thread):
+    def __init__(self, handler, src_dir):
+        super().__init__(daemon=True)
+        self.handler = handler
         self.src_dir = src_dir
-        self.parent = parent
+        self.observer = Observer()
 
     def run(self):
-        self.observer = Observer()
-        self.observer.schedule(self.backup_handler, path=self.src_dir, recursive=False)
+        self.observer.schedule(self.handler, path=self.src_dir, recursive=False)
         self.observer.start()
-        self.exec_()
+        self.observer.join()
 
     def stop(self):
-        if self.observer:
-            try:
-                self.parent.log("Stopping observer...")
-                self.observer.stop()
-                self.observer.join(timeout=5)
-                self.parent.log("Observer stopped.")
-            except Exception as e:
-                self.parent.log(f"Error stopping observer: {e}")
-        self.quit()
-        self.wait()
+        self.handler.stop()
+        self.observer.stop()
+        self.observer.join()
 
+# ---------------- Main App ---------------- #
 class BackupApp(QWidget):
     def __init__(self):
         super().__init__()
-
-        self.log_file_path = os.path.join(os.getcwd(), "backup_manager.log")
-        with open(self.log_file_path, 'w') as f:
-            f.write("=== Backup Manager Started ===\n")
-
         self.setWindowTitle("Backup Manager")
-        self.setGeometry(200, 200, 400, 817)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_title_with_time)
-        self.timer.start(1000)
-
-        self.backup_dict = {}
-        self.monitoring = False
+        self.resize(1100, 600)
 
         self.config = load_config()
-        self.src_dir = self.config.get("src_dir", "")
-        self.backup_dir = self.config.get("backup_dir", "")
-        self.filename_pattern = self.config.get("filename_pattern", "*.sav")
-        self.timeout = self.config.get("timeout", 5)
-
-        self.initUI()
-
-        self.src_input.setText(self.src_dir)
-        self.dest_input.setText(self.backup_dir)
-        self.filename_pattern_input.setText(self.filename_pattern)
-        self.timeout_input.setValue(self.timeout)
-
-        if self.config.get("keep_on_top", True):
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-        else:
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
-
-        if self.src_dir and self.backup_dir and self.filename_pattern:
-            QTimer.singleShot(500, self.start_backup_monitoring)
-
-
-    def toggle_on_top(self, state):
-        if state == Qt.Checked:
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
-            self.log("Window set to stay on top.")
-            self.config['keep_on_top'] = True
-        else:
-            self.setWindowFlag(Qt.WindowStaysOnTopHint, False)
-            self.log("Window will no longer stay on top.")
-            self.config['keep_on_top'] = False
-
-        save_config(self.config)  # Save current config immediately
-
-        self.show()  # Re-apply flags, required to update window
-
-
-    def update_title_with_time(self):
-        current_time = QTime.currentTime().toString("HH:mm:ss")
-        self.setWindowTitle(f"Backup Manager - {current_time}")
-
-    def initUI(self):
-        layout = QVBoxLayout()
-
-        self.label = QLabel("Choose source directory (to watch):")
-        layout.addWidget(self.label)
-
-        self.src_input = QLineEdit(self)
-        self.src_input.setReadOnly(True)
-        layout.addWidget(self.src_input)
-
-        self.select_src_button = QPushButton("Select Source Directory", self)
-        self.select_src_button.clicked.connect(self.select_src_directory)
-        layout.addWidget(self.select_src_button)
-
-        self.dest_label = QLabel("Choose backup directory:")
-        layout.addWidget(self.dest_label)
-
-        self.dest_input = QLineEdit(self)
-        self.dest_input.setReadOnly(True)
-        layout.addWidget(self.dest_input)
-
-        self.select_dest_button = QPushButton("Select Backup Directory", self)
-        self.select_dest_button.clicked.connect(self.select_dest_directory)
-        layout.addWidget(self.select_dest_button)
-
-        self.timeout_label = QLabel("Backup Timeout (seconds):")
-        layout.addWidget(self.timeout_label)
-
-        self.timeout_input = QSpinBox(self)
-        self.timeout_input.setRange(1, 9999)
-        layout.addWidget(self.timeout_input)
-
-        self.filename_pattern_label = QLabel("Enter the filename or pattern (e.g., *.sav):")
-        layout.addWidget(self.filename_pattern_label)
-
-        self.filename_pattern_input = QLineEdit(self)
-        layout.addWidget(self.filename_pattern_input)
-
-        self.date_folder_checkbox = QCheckBox("Create backup folder with today's date", self)
-        self.date_folder_checkbox.setChecked(True)
-        layout.addWidget(self.date_folder_checkbox)
-
-        self.start_button = QPushButton("Start Watching", self)
-        self.start_button.clicked.connect(self.start_backup_monitoring)
-        layout.addWidget(self.start_button)
-
-        self.stop_button = QPushButton("Stop Watching", self)
-        self.stop_button.clicked.connect(self.stop_backup_monitoring)
-        self.stop_button.setEnabled(False)
-        layout.addWidget(self.stop_button)
-
-        self.log_label = QLabel("Backups:")
-        layout.addWidget(self.log_label)
-        self.file_list_widget = QListWidget(self)
-        layout.addWidget(self.file_list_widget)
-
-        self.restore_button = QPushButton("Restore Backup", self)
-        self.restore_button.clicked.connect(self.restore_backup)
-        layout.addWidget(self.restore_button)
-
-        self.log_label = QLabel("Logs:")
-        layout.addWidget(self.log_label)
-
-        self.log_widget = QListWidget(self)
-        self.log_widget.setMinimumHeight(100)
-        layout.addWidget(self.log_widget)
-
-        self.clear_log_button = QPushButton("Clear Logs", self)
-        self.clear_log_button.clicked.connect(self.clear_logs)
-        layout.addWidget(self.clear_log_button)
-
-        self.keep_on_top_checkbox = QCheckBox("Keep window on top", self)
-        self.keep_on_top_checkbox.setChecked(self.config.get("keep_on_top", True))  # Load default from config
-        self.keep_on_top_checkbox.stateChanged.connect(self.toggle_on_top)
-        layout.addWidget(self.keep_on_top_checkbox)
-
-        self.setLayout(layout)
-
-        self.backup_handler = None
+        self.backup_dict = {}
+        self.handler = None
         self.watcher_thread = None
 
-    def log(self, message):
-        timestamp = datetime.now().strftime("[%H:%M:%S]")
-        full_msg = f"{timestamp} {message}"
+        self.initUI()
+        self.load_previous_backups()
 
-        # Add the message to the GUI log list
-        self.log_widget.addItem(full_msg)
+    def initUI(self):
+        main_layout = QHBoxLayout(self)
+        left_layout = QVBoxLayout()
 
-        # Keep only the last 10 log messages visible in the widget
-        while self.log_widget.count() > 10:
-            self.log_widget.takeItem(0)
+        # Source dir
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Choose source directory"))
+        self.src_input = QLineEdit(self.config.get("src_dir", ""))
+        self.src_input.setReadOnly(True)
+        row1.addWidget(self.src_input)
+        btn_src = QPushButton("Browse")
+        btn_src.clicked.connect(self.select_src_directory)
+        row1.addWidget(btn_src)
+        left_layout.addLayout(row1)
 
-        # Scroll to the newest item
-        last_index = self.log_widget.count() - 1
-        if last_index >= 0:
-            self.log_widget.scrollToItem(self.log_widget.item(last_index), QAbstractItemView.PositionAtBottom)
+        # Backup dir
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Choose backup directory"))
+        self.dest_input = QLineEdit(self.config.get("backup_dir", ""))
+        self.dest_input.setReadOnly(True)
+        row2.addWidget(self.dest_input)
+        btn_dest = QPushButton("Browse")
+        btn_dest.clicked.connect(self.select_dest_directory)
+        row2.addWidget(btn_dest)
+        left_layout.addLayout(row2)
 
-        # Append the log message to the log file
-        try:
-            # Append to log file
-            with open(self.log_file_path, 'a') as f:
-                f.write(full_msg + "\n")
-        except Exception as e:
-            print(f"Failed to write log to file: {e}")
+        # Filename + Timeout + Checkbox
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Filename:"))
+        self.filename_pattern_input = QLineEdit(self.config.get("filename_pattern", "*.sav"))
+        row3.addWidget(self.filename_pattern_input)
+        row3.addWidget(QLabel("Backup timeout:"))
+        self.timeout_input = QSpinBox()
+        self.timeout_input.setValue(self.config.get("timeout", 5))
+        self.timeout_input.setRange(1, 9999)
+        row3.addWidget(self.timeout_input)
+        self.date_folder_checkbox = QCheckBox("Create backup folder with today's date")
+        self.date_folder_checkbox.setChecked(True)
+        row3.addWidget(self.date_folder_checkbox)
+        left_layout.addLayout(row3)
 
-        # Also print to console
-        print(full_msg)
+        # Start/Stop buttons
+        row4 = QHBoxLayout()
+        self.start_btn = QPushButton("Start Watching")
+        self.start_btn.clicked.connect(self.start_backup_monitoring)
+        row4.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("Stop Watching")
+        self.stop_btn.clicked.connect(self.stop_backup_monitoring)
+        self.stop_btn.setEnabled(False)
+        row4.addWidget(self.stop_btn)
+        left_layout.addLayout(row4)
 
+        # Backup Table
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Backuped Filename", "Date", "Screenshot", "Restore"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        left_layout.addWidget(self.table)
+        main_layout.addLayout(left_layout, 3)
 
-    def clear_logs(self):
-        self.log_widget.clear()
+        # Logs
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(QLabel("Logs"))
+        self.log_widget = QListWidget()
+        right_layout.addWidget(self.log_widget)
+        main_layout.addLayout(right_layout, 1)
+
+    def log(self, msg):
+        ts = datetime.now().strftime("[%H:%M:%S]")
+        self.log_widget.addItem(f"{ts} {msg}")
+        self.log_widget.scrollToBottom()
+        print(f"{ts} {msg}")
 
     def select_src_directory(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Directory")
-        if folder:
-            self.src_input.setText(folder)
+        if folder: self.src_input.setText(folder)
 
     def select_dest_directory(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Backup Directory")
-        if folder:
-            self.dest_input.setText(folder)
+        if folder: self.dest_input.setText(folder)
+
+    def add_backup_to_table(self, filename, original_file, screenshot_path, date_str=None):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(filename))
+        self.table.setItem(row, 1, QTableWidgetItem(date_str or datetime.now().strftime("%d-%m-%Y %H:%M:%S")))
+        thumb = HoverThumbnail(screenshot_path)
+        self.table.setCellWidget(row, 2, thumb)
+        btn_restore = QPushButton("Restore")
+        btn_restore.clicked.connect(lambda _, f=filename: self.restore_backup(f))
+        self.table.setCellWidget(row, 3, btn_restore)
+        self.backup_dict[filename] = original_file
 
     def start_backup_monitoring(self):
-        src_dir = self.src_input.text()
-        backup_dir = self.dest_input.text()
-        timeout = self.timeout_input.value()
-        filename_pattern = self.filename_pattern_input.text()
-        create_date_dir = self.date_folder_checkbox.isChecked()
-
-        if src_dir and backup_dir and filename_pattern:
-            self.backup_handler = BackupHandler(backup_dir, timeout, self.file_list_widget, src_dir, filename_pattern, create_date_dir, self)
-            self.watcher_thread = WatcherThread(self.backup_handler, src_dir, self)
-            self.watcher_thread.start()
-            self.monitoring = True
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.log("Monitoring started.")
-
-            config = {
-                "backup_dir": backup_dir,
-                "src_dir": src_dir,
-                "filename_pattern": filename_pattern,
-                "timeout": timeout,
-                "keep_on_top": self.keep_on_top_checkbox.isChecked()
-            }
-            save_config(config)
-            self.config = config
-        else:
-            self.log("Please select both the source and backup directories and enter a valid filename pattern.")
+        src = self.src_input.text()
+        dest = self.dest_input.text()
+        if not src or not dest:
+            self.log("Please set both source and backup directories.")
+            return
+        self.handler = BackupHandler(self, dest, self.timeout_input.value(),
+                                     src, self.filename_pattern_input.text(),
+                                     self.date_folder_checkbox.isChecked())
+        self.handler.backup_done.connect(self.add_backup_to_table)
+        self.watcher_thread = WatcherThread(self.handler, src)
+        self.watcher_thread.start()
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.log("Started monitoring.")
+        save_config({
+            "src_dir": src,
+            "backup_dir": dest,
+            "filename_pattern": self.filename_pattern_input.text(),
+            "timeout": self.timeout_input.value(),
+            "keep_on_top": True
+        })
 
     def stop_backup_monitoring(self):
         if self.watcher_thread:
-            try:
-                self.log("Attempting to stop watcher thread...")
-                self.watcher_thread.stop()
-                self.log("Watcher thread stopped.")
-                self.monitoring = False
-                self.start_button.setEnabled(True)
-                self.stop_button.setEnabled(False)
-                self.log("Monitoring stopped.")
-            except Exception as e:
-                self.log(f"Error stopping watcher thread: {e}")
+            self.watcher_thread.stop()
+            self.log("Stopped monitoring.")
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
-    def restore_backup(self):
+    def restore_backup(self, backup_filename):
+        """
+        Restore a backup file or folder into the original source directory.
+        Uses the full backup path stored in self.backup_dict.
+        """
         global g_stop_watching
         g_stop_watching = True
-        selected_item = self.file_list_widget.currentItem()
-        if selected_item:
-            backup_file = selected_item.text()
-            if backup_file in self.backup_dict:
-                original_file = self.backup_dict[backup_file]
-                try:
-                    full_path = os.path.join(self.dest_input.text(), backup_file)
-                    self.log(f"Restoring {backup_file} to {original_file}")
-                    shutil.copy2(full_path, original_file)
-                    self.log(f"Restored {backup_file}. Watching again....")
-                    time.sleep(1)
-                except Exception as e:
-                    self.log(f"Error restoring file: {e}")
+
+        if backup_filename not in self.backup_dict:
+            self.log(f"Backup not found in table: {backup_filename}")
+            g_stop_watching = False
+            return
+
+        backup_path = self.backup_dict[backup_filename]  # get the full path from table
+        source_dir = self.src_input.text()
+        if not source_dir:
+            self.log("Source directory not set!")
+            g_stop_watching = False
+            return
+
+        # Determine the original watched file/folder name
+        watched_name = self.filename_pattern_input.text()
+        if "*" in watched_name:
+            watched_name = watched_name.split("*")[0]  # get base part
+
+        original_path = os.path.join(source_dir, watched_name)
+
+        try:
+            self.log(f"Restoring {backup_filename} -> {original_path}")
+
+            self.log(backup_path)
+            if os.path.isfile(backup_path):
+                os.makedirs(os.path.dirname(original_path), exist_ok=True)
+                shutil.copy2(backup_path, original_path)
+                self.log(f"Restore complete: {backup_filename}")
+            elif os.path.isdir(backup_path):
+                os.makedirs(original_path, exist_ok=True)
+                # Copy all contents recursively
+                for item in os.listdir(backup_path):
+                    src_item = os.path.join(backup_path, item)
+                    dest_item = os.path.join(original_path, item)
+                    if os.path.isfile(src_item):
+                        shutil.copy2(src_item, dest_item)
+                    elif os.path.isdir(src_item):
+                        if not os.path.exists(dest_item):
+                            shutil.copytree(src_item, dest_item)
+                        else:
+                            # Folder exists, copy contents recursively
+                            for root, dirs, files in os.walk(src_item):
+                                rel_path = os.path.relpath(root, src_item)
+                                target_root = os.path.join(dest_item, rel_path)
+                                os.makedirs(target_root, exist_ok=True)
+                                for f in files:
+                                    shutil.copy2(os.path.join(root, f), os.path.join(target_root, f))
+                self.log(f"Restore complete: {backup_filename}")
+
             else:
-                self.log("No backup found for the selected file.")
-        else:
-            self.log("Please select a backup file to restore.")
+                self.log("Restore failed: unknown file type!")
+
+        except Exception as e:
+            self.log(f"Error restoring backup: {e}")
+
         g_stop_watching = False
 
 
-    def add_to_backup_dict(self, destination_file_name, original_file_path):
-        if self.date_folder_checkbox.isChecked():
-            original_dest_file_name = destination_file_name
-            destination_file_name = os.path.join(datetime.now().strftime("%d-%m-%Y"), original_dest_file_name)
-            self.log(f"{destination_file_name}")
-        self.backup_dict[destination_file_name] = original_file_path
-        self.file_list_widget.addItem(destination_file_name)
-        self.file_list_widget.scrollToBottom()
+    def load_previous_backups(self):
+        """Scan backup directory and populate table with backups inside date folders."""
+        dest = self.config.get("backup_dir", "")
+        if not dest or not os.path.exists(dest):
+            return
 
-    def closeEvent(self, event):
-        if self.watcher_thread:
-            self.watcher_thread.stop()
-        event.accept()
+        # Iterate over date folders
+        for date_folder in os.listdir(dest):
+            date_folder_path = os.path.join(dest, date_folder)
+            if not os.path.isdir(date_folder_path):
+                continue  # skip files at top level
 
-if __name__ == '__main__':
+            # Iterate over backups inside the date folder (including timestamped folders)
+            for backup_name in os.listdir(date_folder_path):
+                backup_path = os.path.join(date_folder_path, backup_name)
+
+                # Skip screenshots
+                if backup_name.endswith(".png"):
+                    continue
+
+                # Determine creation/modification datetime
+                backup_datetime = datetime.fromtimestamp(os.path.getmtime(backup_path))
+                date_str = backup_datetime.strftime("%d-%m-%Y %H:%M:%S")
+
+                # Screenshot path (optional)
+                screenshot_path = backup_path + ".png"
+
+                # Add to table
+                self.add_backup_to_table(backup_name, backup_path, screenshot_path, date_str)
+
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = BackupApp()
     window.show()
