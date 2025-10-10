@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-import os, sys, shutil, fnmatch, threading, time, json
+import os, sys, shutil, fnmatch, threading, time, json, gc
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
     QFileDialog, QLabel, QLineEdit, QSpinBox, QCheckBox, 
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
-    QListWidget, QStackedWidget
+    QListWidget, QStackedWidget, QListWidgetItem, QMessageBox
 )
 from PyQt5.QtCore import Qt, QObject, pyqtSignal, QSize
 from PyQt5.QtGui import QPixmap
+from PyQt5 import QtGui
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from PIL import ImageGrab
@@ -28,7 +29,15 @@ def load_config():
     if os.path.exists(path):
         with open(path, 'r') as f:
             return json.load(f)
-    return {"backup_dir": "", "src_dir": "", "filename_pattern": "*.sav", "timeout": 5, "keep_on_top": True}
+    return {
+        "backup_dir": "",
+        "src_dir": "",
+        "filename_pattern": "*.sav",
+        "timeout": 5,
+        "keep_on_top": True,
+        "dark_mode": False,
+        "num_previous_backups": 10  # default number of previous backups to load
+    }
 
 def save_config(config):
     path = get_config_file_path()
@@ -68,16 +77,16 @@ class HoverThumbnail(QLabel):
 
         self.setFixedSize(48,48)
 
-        if os.path.exists(img_path):
+        # Only try to load pixmap if file exists and is a file
+        if img_path and os.path.isfile(img_path):
             pixmap = QPixmap(img_path)
             pixmap = pixmap.scaled(48, 48, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             self.setPixmap(pixmap)
         else:
             self.setText("️⛔️")
 
-
     def mousePressEvent(self, event):
-        if os.path.exists(self.img_path) and self.main_window:
+        if self.img_path and os.path.isfile(self.img_path) and self.main_window:
             overlay = ImageOverlay(self.main_window, self.img_path)
             overlay.show()
             overlay.raise_()
@@ -233,10 +242,14 @@ class BackupApp(QWidget):
         self.initUI()
         self.load_previous_backups()
 
+        # Apply dark mode if enabled
+        if self.config.get("dark_mode", False):
+            self.apply_dark_mode(True)
+            self.dark_mode_checkbox.setChecked(True)
+
         # Start watching automatically if directories are set
         if self.src_input.text() and self.dest_input.text():
             self.start_backup_monitoring()
-
 
     def initUI(self):
         main_layout = QHBoxLayout(self)
@@ -279,20 +292,36 @@ class BackupApp(QWidget):
         row3.addWidget(self.date_folder_checkbox)
         left_layout.addLayout(row3)
 
-        # Start/Stop buttons
+        # Number of previous backups to load + Dark mode in one row
         row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Number of previous backups to load:"))
+        self.num_previous_backups_input = QSpinBox()
+        self.num_previous_backups_input.setRange(1, 100)
+        self.num_previous_backups_input.setValue(self.config.get("num_previous_backups", 10))
+        self.num_previous_backups_input.valueChanged.connect(self.on_num_previous_backups_changed)
+        row4.addWidget(self.num_previous_backups_input)
+        # Add stretch to separate the widgets
+        row4.addStretch()
+        self.dark_mode_checkbox = QCheckBox("Dark Mode")
+        self.dark_mode_checkbox.setChecked(self.config.get("dark_mode", False))
+        self.dark_mode_checkbox.stateChanged.connect(self.on_dark_mode_toggle)
+        row4.addWidget(self.dark_mode_checkbox)
+        left_layout.addLayout(row4)
+
+        # Start/Stop buttons
+        row5 = QHBoxLayout()
         self.start_btn = QPushButton("Start Watching")
         self.start_btn.clicked.connect(self.start_backup_monitoring)
-        row4.addWidget(self.start_btn)
+        row5.addWidget(self.start_btn)
         self.stop_btn = QPushButton("Stop Watching")
         self.stop_btn.clicked.connect(self.stop_backup_monitoring)
         self.stop_btn.setEnabled(False)
-        row4.addWidget(self.stop_btn)
-        left_layout.addLayout(row4)
+        row5.addWidget(self.stop_btn)
+        left_layout.addLayout(row5)
 
         # Backup Table
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Backuped Filename", "Date", "Screenshot", "Restore"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Backuped Filename", "Date", "Screenshot", "Restore", "Delete"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
         # make table read-only and not selectable
@@ -310,9 +339,17 @@ class BackupApp(QWidget):
         right_layout.addWidget(self.log_widget)
         main_layout.addLayout(right_layout, 1)
 
-    def log(self, msg):
+    def log(self, msg, error=False, color=None):
         ts = datetime.now().strftime("[%H:%M:%S]")
-        self.log_widget.addItem(f"{ts} {msg}")
+        item = QListWidgetItem(f"{ts} {msg}")
+        # Color logic
+        if color:
+            item.setForeground(QtGui.QColor(color))
+        elif error or "error" in msg.lower() or "failed" in msg.lower():
+            item.setForeground(QtGui.QColor("red"))
+        elif "backup created" in msg.lower():
+            item.setForeground(QtGui.QColor("green"))
+        self.log_widget.addItem(item)
         self.log_widget.scrollToBottom()
         print(f"{ts} {msg}")
 
@@ -332,12 +369,14 @@ class BackupApp(QWidget):
 
         self.table.insertRow(row)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
 
         self.table.setItem(row, 0, QTableWidgetItem(filename))
         self.table.setItem(row, 1, QTableWidgetItem(date_str or datetime.now().strftime("%d-%m-%Y %H:%M:%S")))
 
-        # Load thumbnail
-        thumb = HoverThumbnail(screenshot_path, main_window=self)
+        # Only pass screenshot_path if it exists and is a file
+        valid_screenshot = screenshot_path if screenshot_path and os.path.isfile(screenshot_path) else None
+        thumb = HoverThumbnail(valid_screenshot, main_window=self)
         # Set row height and column width to match the image
         if thumb.pixmap() is not None:
             pixmap_size = thumb.pixmap().size()
@@ -349,13 +388,103 @@ class BackupApp(QWidget):
         # Put label directly in cell
         self.table.setCellWidget(row, 2, thumb)
 
-        # Restore button
+        # Restore button in its own cell
         btn_restore = QPushButton("Restore")
         btn_restore.clicked.connect(lambda _, f=filename: self.restore_backup(f))
         self.table.setCellWidget(row, 3, btn_restore)
 
+        # Delete button in its own cell
+        btn_delete = QPushButton("🗑")
+        btn_delete.setFixedSize(28, 28)
+        btn_delete.setToolTip("Delete")
+        btn_delete.clicked.connect(lambda _, f=filename: self.delete_backup(f))
+        self.table.setCellWidget(row, 4, btn_delete)
+
         self.backup_dict[filename] = original_file
 
+    def delete_backup(self, backup_filename):
+        """
+        Delete a backup file or folder and its screenshot, with confirmation.
+        """
+        if backup_filename not in self.backup_dict:
+            self.log(f"Backup not found in table: {backup_filename}", error=True)
+            return
+
+        # Confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Delete Backup",
+            f"Are you sure you want to delete backup '{backup_filename}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        backup_path = self.backup_dict[backup_filename]
+        screenshot_path = backup_path + ".png"
+        try:
+            if os.path.isfile(backup_path):
+                os.remove(backup_path)
+            elif os.path.isdir(backup_path):
+                shutil.rmtree(backup_path)
+            if os.path.isfile(screenshot_path):
+                os.remove(screenshot_path)
+            self.log(f"Deleted backup: {backup_filename}", color="orange")
+            # Remove from table and dict
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, 0) and self.table.item(row, 0).text() == backup_filename:
+                    self.table.removeRow(row)
+                    break
+            del self.backup_dict[backup_filename]
+        except Exception as e:
+            self.log(f"Error deleting backup: {e}", error=True)
+
+    def on_dark_mode_toggle(self, state):
+        enabled = bool(state)
+        self.apply_dark_mode(enabled)
+        # Save preference
+        self.config["dark_mode"] = enabled
+        save_config(self.config)
+
+    def on_num_previous_backups_changed(self, value):
+        self.config["num_previous_backups"] = value
+        save_config(self.config)
+        # Reload table with new value
+        self.table.setRowCount(0)
+        self.load_previous_backups()
+
+    def apply_dark_mode(self, enabled):
+        if enabled:
+            # Simple dark stylesheet
+            self.setStyleSheet("""
+                QWidget {
+                    background-color: #232629;
+                    color: #f0f0f0;
+                }
+                QLineEdit, QSpinBox, QListWidget, QTableWidget {
+                    background-color: #2b2b2b;
+                    color: #f0f0f0;
+                    border: 1px solid #444;
+                }
+                QPushButton {
+                    background-color: #444;
+                    color: #f0f0f0;
+                    border: 1px solid #666;
+                }
+                QPushButton:hover {
+                    background-color: #555;
+                }
+                QHeaderView::section {
+                    background-color: #333;
+                    color: #f0f0f0;
+                }
+                QCheckBox {
+                    color: #f0f0f0;
+                }
+            """)
+        else:
+            self.setStyleSheet("")
 
     def start_backup_monitoring(self):
         src = self.src_input.text()
@@ -377,7 +506,9 @@ class BackupApp(QWidget):
             "backup_dir": dest,
             "filename_pattern": self.filename_pattern_input.text(),
             "timeout": self.timeout_input.value(),
-            "keep_on_top": True
+            "keep_on_top": True,
+            "dark_mode": self.dark_mode_checkbox.isChecked(),
+            "num_previous_backups": self.num_previous_backups_input.value()
         })
 
     def stop_backup_monitoring(self):
@@ -386,6 +517,16 @@ class BackupApp(QWidget):
             self.log("Stopped monitoring.")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+
+    def is_file_locked(self, filepath):
+        """Return True if file is locked by another process (including this one)."""
+        if not os.path.isfile(filepath):
+            return False
+        try:
+            with open(filepath, 'a'):
+                return False
+        except Exception:
+            return True
 
     def restore_backup(self, backup_filename):
         """
@@ -414,9 +555,36 @@ class BackupApp(QWidget):
 
         original_path = os.path.join(source_dir, watched_name)
 
+        # --- Stop watcher before restoring ---
+        watcher_was_running = False
+        if self.watcher_thread and self.stop_btn.isEnabled():
+            watcher_was_running = True
+            self.stop_backup_monitoring()
+            # Give the OS a moment to release file handles
+            time.sleep(0.5)
+            gc.collect()
+            # Wait up to 2 seconds for file to be unlocked
+            wait_path = backup_path
+            if os.path.isdir(backup_path):
+                # If restoring a folder, check all files inside
+                files_to_check = []
+                for root, dirs, files in os.walk(backup_path):
+                    for f in files:
+                        files_to_check.append(os.path.join(root, f))
+            else:
+                files_to_check = [backup_path]
+            for _ in range(20):
+                locked = False
+                for f in files_to_check:
+                    if self.is_file_locked(f):
+                        locked = True
+                        break
+                if not locked:
+                    break
+                time.sleep(0.1)
+                gc.collect()
         try:
             self.log(f"Restoring {backup_filename} -> {original_path}")
-
             self.log(backup_path)
             if os.path.isfile(backup_path):
                 os.makedirs(os.path.dirname(original_path), exist_ok=True)
@@ -451,13 +619,17 @@ class BackupApp(QWidget):
 
         g_stop_watching = False
 
+        # --- Restart watcher if it was running before ---
+        if watcher_was_running:
+            self.start_backup_monitoring()
 
     def load_previous_backups(self):
-        """Scan backup directory and populate table with backups in descending order (newest first)."""
+        """Scan backup directory and populate table with up to N newest backups."""
         dest = self.config.get("backup_dir", "")
         if not dest or not os.path.exists(dest):
             return
 
+        num_to_load = self.config.get("num_previous_backups", 10)
         all_backups = []
 
         # Collect all backups from all date folders
@@ -474,10 +646,15 @@ class BackupApp(QWidget):
                     continue
 
                 backup_datetime = os.path.getmtime(backup_path)
+
+                backup_datetime = os.path.getmtime(backup_path)
                 all_backups.append((backup_datetime, backup_name, backup_path, backup_path + ".png"))
 
         # Sort all backups globally by timestamp descending (newest first)
         all_backups.sort(key=lambda x: x[0], reverse=True)
+
+        # Only keep the N most recent
+        all_backups = all_backups[:num_to_load]
 
         # Add sorted backups to the table
         for timestamp, backup_name, backup_path, screenshot_path in all_backups:
@@ -490,5 +667,7 @@ class BackupApp(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = BackupApp()
+    window.setWindowIcon(QtGui.QIcon("C:\\Users\\khali\\Documents\\GameBackupWatcher - Copy\\icon.ico"))
     window.show()
     sys.exit(app.exec_())
+    
