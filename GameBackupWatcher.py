@@ -628,19 +628,18 @@ class BackupApp(QWidget):
             g_stop_watching = False
             return
 
-        backup_path = self.backup_dict[backup_filename]  # get the full path from table
+        backup_path = self.backup_dict[backup_filename]  # full path to the backup copy
         source_dir = self.src_input.text()
         if not source_dir:
             self.log("Source directory not set!")
             g_stop_watching = False
             return
 
-        # Determine the original watched file/folder name
-        watched_name = self.filename_pattern_input.text()
-        if "*" in watched_name:
-            watched_name = watched_name.split("*")[0]  # get base part
-
-        original_path = os.path.join(source_dir, watched_name)
+        # Determine original filename by removing timestamp suffix if present.
+        # Example backup basename: "save1.sav_23-10-2025_12-00-00" -> original "save1.sav"
+        base_backup = os.path.basename(backup_path)
+        original_basename = re.sub(r'_\d{2}-\d{2}-\d{4}_\d{2}-\d{2}-\d{2}$', '', base_backup)
+        original_path = os.path.join(source_dir, original_basename)
 
         # --- Stop watcher before restoring ---
         watcher_was_running = False
@@ -650,65 +649,55 @@ class BackupApp(QWidget):
             # Give the OS a moment to release file handles
             time.sleep(0.5)
             gc.collect()
-            # Wait up to 2 seconds for file to be unlocked
-            wait_path = backup_path
+            # Wait up to 2 seconds for file(s) to be unlocked
             if os.path.isdir(backup_path):
-                # If restoring a folder, check all files inside
-                files_to_check = []
-                for root, dirs, files in os.walk(backup_path):
-                    for f in files:
-                        files_to_check.append(os.path.join(root, f))
+                files_to_check = [os.path.join(root, f) for root, _, files in os.walk(backup_path) for f in files]
             else:
                 files_to_check = [backup_path]
             for _ in range(20):
-                locked = False
-                for f in files_to_check:
-                    if self.is_file_locked(f):
-                        locked = True
-                        break
-                if not locked:
+                if not any(self.is_file_locked(f) for f in files_to_check):
                     break
                 time.sleep(0.1)
                 gc.collect()
+
         try:
             self.log(f"Restoring {backup_filename} -> {original_path}")
             self.log(backup_path)
             if os.path.isfile(backup_path):
-                os.makedirs(os.path.dirname(original_path), exist_ok=True)
+                os.makedirs(os.path.dirname(original_path) or source_dir, exist_ok=True)
                 shutil.copy2(backup_path, original_path)
-                self.log(f"Restore complete: {backup_filename}")
+                self.log(f"Restore complete: {original_basename}")
             elif os.path.isdir(backup_path):
+                # create/ensure target folder exists
                 os.makedirs(original_path, exist_ok=True)
-                # Copy all contents recursively
+                # Copy all contents recursively into original_path
                 for item in os.listdir(backup_path):
                     src_item = os.path.join(backup_path, item)
                     dest_item = os.path.join(original_path, item)
                     if os.path.isfile(src_item):
+                        os.makedirs(os.path.dirname(dest_item), exist_ok=True)
                         shutil.copy2(src_item, dest_item)
                     elif os.path.isdir(src_item):
                         if not os.path.exists(dest_item):
                             shutil.copytree(src_item, dest_item)
                         else:
-                            # Folder exists, copy contents recursively
+                            # Merge contents if dest exists
                             for root, dirs, files in os.walk(src_item):
                                 rel_path = os.path.relpath(root, src_item)
                                 target_root = os.path.join(dest_item, rel_path)
                                 os.makedirs(target_root, exist_ok=True)
                                 for f in files:
                                     shutil.copy2(os.path.join(root, f), os.path.join(target_root, f))
-                self.log(f"Restore complete: {backup_filename}")
-
+                self.log(f"Restore complete: {original_basename}")
             else:
                 self.log("Restore failed: unknown file type!")
-
         except Exception as e:
             self.log(f"Error restoring backup: {e}")
-
-        g_stop_watching = False
-
-        # --- Restart watcher if it was running before ---
-        if watcher_was_running:
-            self.start_backup_monitoring()
+        finally:
+            g_stop_watching = False
+            # --- Restart watcher if it was running before ---
+            if watcher_was_running:
+                self.start_backup_monitoring()
 
     def load_previous_backups(self):
         """Scan backup directory and populate table with up to N newest backups."""
