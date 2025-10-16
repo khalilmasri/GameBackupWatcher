@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-import os, sys, shutil, fnmatch, threading, time, json, gc
+import os, sys, shutil, fnmatch, threading, time, json, gc, re
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, 
-    QFileDialog, QLabel, QLineEdit, QSpinBox, QCheckBox, 
+    QFileDialog, QLabel, QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, 
     QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
-    QListWidget, QStackedWidget, QListWidgetItem, QMessageBox
+    QListWidget, QStackedWidget, QListWidgetItem, QMessageBox, QInputDialog
 )
 from PyQt5.QtCore import Qt, QObject, pyqtSignal, QSize
 from PyQt5.QtGui import QPixmap
@@ -36,7 +36,8 @@ def load_config():
         "timeout": 5,
         "keep_on_top": True,
         "dark_mode": False,
-        "num_previous_backups": 10  # default number of previous backups to load
+        "num_previous_backups": 10,  # default number of previous backups to load
+        "screenshot_offset": 0.5     # default screenshot delay in seconds
     }
 
 def save_config(config):
@@ -95,7 +96,7 @@ class HoverThumbnail(QLabel):
 class BackupHandler(QObject, FileSystemEventHandler):
     backup_done = pyqtSignal(str, str, str)  # filename, original path, screenshot
 
-    def __init__(self, parent, backup_dir, timeout, src_dir, filename_pattern, create_date_dir):
+    def __init__(self, parent, backup_dir, timeout, src_dir, filename_pattern, create_date_dir, screenshot_offset=0.5):
         super().__init__()
         self.parent = parent
         self.backup_dir = backup_dir
@@ -103,6 +104,7 @@ class BackupHandler(QObject, FileSystemEventHandler):
         self.src_dir = src_dir
         self.filename_pattern = filename_pattern
         self.create_date_dir = create_date_dir
+        self.screenshot_offset = float(screenshot_offset)
         self.stop_requested = False
 
     def wait_for_next_timeout(self):
@@ -171,8 +173,8 @@ class BackupHandler(QObject, FileSystemEventHandler):
             destination_file_name = f"{file_name}_{timestamp}"
             destination_path = os.path.join(backup_path, destination_file_name)
 
-            # Take screenshot of main monitor
-            time.sleep(0.5)
+            # Take screenshot of main monitor (use configurable offset)
+            time.sleep(self.screenshot_offset)
             screenshot_path = destination_path + ".png"
             try:
                 from PIL import ImageGrab
@@ -196,7 +198,8 @@ class BackupHandler(QObject, FileSystemEventHandler):
 
             # Emit signal to safely update GUI
             if hasattr(self, "backup_done"):
-                self.backup_done.emit(destination_file_name, file_path, screenshot_path)
+                # emit the actual backup path so UI operations (restore/delete/rename) act on the backup copy
+                self.backup_done.emit(destination_file_name, destination_path, screenshot_path)
             if self.parent and hasattr(self.parent, "log"):
                 self.parent.log(f"Backup created: {destination_file_name}")
                 self.wait_for_next_timeout()
@@ -290,6 +293,15 @@ class BackupApp(QWidget):
         self.date_folder_checkbox = QCheckBox("Create backup folder with today's date")
         self.date_folder_checkbox.setChecked(True)
         row3.addWidget(self.date_folder_checkbox)
+        # Screenshot offset control
+        row3.addWidget(QLabel("Screenshot offset (s):"))
+        self.screenshot_offset_input = QDoubleSpinBox()
+        self.screenshot_offset_input.setRange(0.0, 30.0)
+        self.screenshot_offset_input.setDecimals(2)
+        self.screenshot_offset_input.setSingleStep(0.1)
+        self.screenshot_offset_input.setValue(self.config.get("screenshot_offset", 0.5))
+        self.screenshot_offset_input.valueChanged.connect(self.on_screenshot_offset_changed)
+        row3.addWidget(self.screenshot_offset_input)
         left_layout.addLayout(row3)
 
         # Number of previous backups to load + Dark mode in one row
@@ -319,9 +331,9 @@ class BackupApp(QWidget):
         row5.addWidget(self.stop_btn)
         left_layout.addLayout(row5)
 
-        # Backup Table
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Backuped Filename", "Date", "Screenshot", "Restore", "Delete"])
+        # Backup Table (now with Rename column)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Backuped Filename", "Date", "Screenshot", "Restore", "Delete", "Rename"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
         # make table read-only and not selectable
@@ -370,6 +382,7 @@ class BackupApp(QWidget):
         self.table.insertRow(row)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
 
         self.table.setItem(row, 0, QTableWidgetItem(filename))
         self.table.setItem(row, 1, QTableWidgetItem(date_str or datetime.now().strftime("%d-%m-%Y %H:%M:%S")))
@@ -384,21 +397,31 @@ class BackupApp(QWidget):
             pixmap_size = QSize(48, 48)
         self.table.setRowHeight(row, 48)
         self.table.setColumnWidth(2, 48)
-
-        # Put label directly in cell
+        # ensure action columns have reasonable sizing
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+ 
+         # Put label directly in cell
         self.table.setCellWidget(row, 2, thumb)
-
+ 
         # Restore button in its own cell
         btn_restore = QPushButton("Restore")
         btn_restore.clicked.connect(lambda _, f=filename: self.restore_backup(f))
         self.table.setCellWidget(row, 3, btn_restore)
 
-        # Delete button in its own cell
+        # Delete button in its own cell (small)
         btn_delete = QPushButton("🗑")
-        btn_delete.setFixedSize(28, 28)
         btn_delete.setToolTip("Delete")
         btn_delete.clicked.connect(lambda _, f=filename: self.delete_backup(f))
         self.table.setCellWidget(row, 4, btn_delete)
+
+        # Rename button in its own cell
+        btn_rename = QPushButton("Rename")
+        btn_rename.clicked.connect(lambda _, f=filename: self.rename_backup(f))
+        self.table.setCellWidget(row, 5, btn_rename)
+ 
+        
 
         self.backup_dict[filename] = original_file
 
@@ -440,6 +463,56 @@ class BackupApp(QWidget):
         except Exception as e:
             self.log(f"Error deleting backup: {e}", error=True)
 
+    def rename_backup(self, backup_filename):
+        """Prompt for a new base name, rename backup file/folder and its .png screenshot, update table and mapping."""
+        if backup_filename not in self.backup_dict:
+            self.log(f"Backup not found in table: {backup_filename}", error=True)
+            return
+
+        current_path = self.backup_dict[backup_filename]
+        parent = os.path.dirname(current_path)
+        base = os.path.basename(current_path)
+
+        # extract timestamp suffix if present: _DD-MM-YYYY_HH-MM-SS
+        m = re.search(r'(_\d{2}-\d{2}-\d{4}_\d{2}-\d{2}-\d{2})$', base)
+        timestamp_suffix = m.group(1) if m else ""
+
+        new_name, ok = QInputDialog.getText(self, "Rename Backup", "New base name (without timestamp):", text=(base.replace(timestamp_suffix,"") if timestamp_suffix else base))
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+
+        new_path = os.path.join(parent, new_name)
+
+        # guard: don't overwrite existing
+        if os.path.exists(new_path) or os.path.exists(new_path + ".png"):
+            self.log("A file with the new name already exists.", error=True)
+            return
+
+        try:
+            # rename file/folder
+            shutil.move(current_path, new_path)
+            # rename screenshot if exists
+            old_screenshot = current_path + ".png"
+            new_screenshot = new_path + ".png"
+            if os.path.exists(old_screenshot):
+                shutil.move(old_screenshot, new_screenshot)
+
+            # Update mapping and table display
+            # find row and update name cell
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, 0) and self.table.item(row, 0).text() == backup_filename:
+                    self.table.item(row, 0).setText(new_name)
+                    break
+
+            # update dict key -> new path: remove old entry and insert new
+            del self.backup_dict[backup_filename]
+            self.backup_dict[new_name] = new_path
+
+            self.log(f"Renamed backup: {backup_filename} -> {new_name}", color="blue")
+        except Exception as e:
+            self.log(f"Error renaming backup: {e}", error=True)
+
     def on_dark_mode_toggle(self, state):
         enabled = bool(state)
         self.apply_dark_mode(enabled)
@@ -453,6 +526,16 @@ class BackupApp(QWidget):
         # Reload table with new value
         self.table.setRowCount(0)
         self.load_previous_backups()
+
+    def on_screenshot_offset_changed(self, value):
+        self.config["screenshot_offset"] = float(value)
+        save_config(self.config)
+        # If handler exists, update its value for future backups
+        if self.handler:
+            try:
+                self.handler.screenshot_offset = float(value)
+            except Exception:
+                pass
 
     def apply_dark_mode(self, enabled):
         if enabled:
@@ -492,9 +575,12 @@ class BackupApp(QWidget):
         if not src or not dest:
             self.log("Please set both source and backup directories.")
             return
-        self.handler = BackupHandler(self, dest, self.timeout_input.value(),
-                                     src, self.filename_pattern_input.text(),
-                                     self.date_folder_checkbox.isChecked())
+        self.handler = BackupHandler(
+            self, dest, self.timeout_input.value(),
+            src, self.filename_pattern_input.text(),
+            self.date_folder_checkbox.isChecked(),
+            screenshot_offset=self.screenshot_offset_input.value()
+        )
         self.handler.backup_done.connect(self.add_backup_to_table)
         self.watcher_thread = WatcherThread(self.handler, src)
         self.watcher_thread.start()
@@ -508,7 +594,8 @@ class BackupApp(QWidget):
             "timeout": self.timeout_input.value(),
             "keep_on_top": True,
             "dark_mode": self.dark_mode_checkbox.isChecked(),
-            "num_previous_backups": self.num_previous_backups_input.value()
+            "num_previous_backups": self.num_previous_backups_input.value(),
+            "screenshot_offset": self.screenshot_offset_input.value()
         })
 
     def stop_backup_monitoring(self):
@@ -670,4 +757,3 @@ if __name__ == "__main__":
     window.setWindowIcon(QtGui.QIcon("C:\\Users\\khali\\Documents\\GameBackupWatcher - Copy\\icon.ico"))
     window.show()
     sys.exit(app.exec_())
-    
