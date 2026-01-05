@@ -36,6 +36,8 @@ def load_config():
         "timeout": 5,
         "keep_on_top": True,
         "dark_mode": False,
+        "watch_filename_changes": False,
+        "max_logs": 500,
         "num_previous_backups": 10,  # default number of previous backups to load
         "screenshot_offset": 0.5     # default screenshot delay in seconds
     }
@@ -96,7 +98,7 @@ class HoverThumbnail(QLabel):
 class BackupHandler(QObject, FileSystemEventHandler):
     backup_done = pyqtSignal(str, str, str)  # filename, original path, screenshot
 
-    def __init__(self, parent, backup_dir, timeout, src_dir, filename_pattern, create_date_dir, screenshot_offset=0.5):
+    def __init__(self, parent, backup_dir, timeout, src_dir, filename_pattern, create_date_dir, screenshot_offset=0.5, watch_filename_changes=False):
         super().__init__()
         self.parent = parent
         self.backup_dir = backup_dir
@@ -105,7 +107,25 @@ class BackupHandler(QObject, FileSystemEventHandler):
         self.filename_pattern = filename_pattern
         self.create_date_dir = create_date_dir
         self.screenshot_offset = float(screenshot_offset)
+        self.watch_filename_changes = bool(watch_filename_changes)
+        # map of target file -> last known mtime to detect changes
+        self._prev_mtimes = {}
         self.stop_requested = False
+        # initialize previous mtime for literal filename patterns (search anywhere under src_dir)
+        if self.watch_filename_changes:
+            is_literal = not any(c in self.filename_pattern for c in ['*', '?', '['])
+            if is_literal and os.path.isdir(self.src_dir):
+                try:
+                    for root, _, files in os.walk(self.src_dir):
+                        for f in files:
+                            if f == self.filename_pattern:
+                                p = os.path.join(root, f)
+                                try:
+                                    self._prev_mtimes[p] = os.path.getmtime(p)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
 
     def wait_for_next_timeout(self):
         global g_stop_watching
@@ -151,7 +171,39 @@ class BackupHandler(QObject, FileSystemEventHandler):
             return
         if self.stop_requested or not os.path.exists(event.src_path):
             return
-        if fnmatch.fnmatch(os.path.basename(event.src_path), self.filename_pattern):
+        basename = os.path.basename(event.src_path)
+        if fnmatch.fnmatch(basename, self.filename_pattern):
+            # If configured to watch a specific filename for changes and the pattern is a literal filename
+            is_literal = not any(c in self.filename_pattern for c in ['*', '?', '['])
+            if self.watch_filename_changes and is_literal:
+                # Use the actual event path as the target (handles files in subfolders)
+                target_path = event.src_path
+                try:
+                    if os.path.exists(target_path) and os.path.isfile(target_path):
+                        mtime = os.path.getmtime(target_path)
+                    else:
+                        mtime = None
+                except Exception:
+                    mtime = None
+
+                prev = self._prev_mtimes.get(target_path)
+                # If we haven't seen this file before, treat this as a change and trigger a backup
+                if prev is None:
+                    if mtime is not None:
+                        self._prev_mtimes[target_path] = mtime
+                    # trigger full-source backup on first detection
+                    g_stop_watching = True
+                    threading.Thread(target=self.backup_file, args=(self.src_dir,), daemon=True).start()
+                    return
+
+                # If mtime changed, copy entire source directory instead of only the file
+                if mtime is not None and prev != mtime:
+                    self._prev_mtimes[target_path] = mtime
+                    g_stop_watching = True
+                    threading.Thread(target=self.backup_file, args=(self.src_dir,), daemon=True).start()
+                    return
+
+            # Default behavior: back up the matched file/folder
             g_stop_watching = True
             threading.Thread(target=self.backup_file, args=(event.src_path,), daemon=True).start()
 
@@ -293,6 +345,10 @@ class BackupApp(QWidget):
         self.date_folder_checkbox = QCheckBox("Create backup folder with today's date")
         self.date_folder_checkbox.setChecked(True)
         row3.addWidget(self.date_folder_checkbox)
+        # If a specific filename is being watched, optionally copy whole src dir on changes
+        self.watch_filename_change_checkbox = QCheckBox("Copy source dir on filename change")
+        self.watch_filename_change_checkbox.setChecked(self.config.get("watch_filename_changes", False))
+        row3.addWidget(self.watch_filename_change_checkbox)
         # Screenshot offset control
         row3.addWidget(QLabel("Screenshot offset (s):"))
         self.screenshot_offset_input = QDoubleSpinBox()
@@ -312,6 +368,13 @@ class BackupApp(QWidget):
         self.num_previous_backups_input.setValue(self.config.get("num_previous_backups", 10))
         self.num_previous_backups_input.valueChanged.connect(self.on_num_previous_backups_changed)
         row4.addWidget(self.num_previous_backups_input)
+        # Max logs control
+        row4.addWidget(QLabel("Max logs:"))
+        self.max_logs_input = QSpinBox()
+        self.max_logs_input.setRange(1, 10000)
+        self.max_logs_input.setValue(self.config.get("max_logs", 500))
+        self.max_logs_input.valueChanged.connect(self.on_max_logs_changed)
+        row4.addWidget(self.max_logs_input)
         # Add stretch to separate the widgets
         row4.addStretch()
         self.dark_mode_checkbox = QCheckBox("Dark Mode")
@@ -349,6 +412,10 @@ class BackupApp(QWidget):
         right_layout.addWidget(QLabel("Logs"))
         self.log_widget = QListWidget()
         right_layout.addWidget(self.log_widget)
+        # Clear logs button
+        btn_clear_logs = QPushButton("Clear Logs")
+        btn_clear_logs.clicked.connect(self.clear_logs)
+        right_layout.addWidget(btn_clear_logs)
         main_layout.addLayout(right_layout, 1)
 
     def log(self, msg, error=False, color=None):
@@ -364,6 +431,17 @@ class BackupApp(QWidget):
         self.log_widget.addItem(item)
         self.log_widget.scrollToBottom()
         print(f"{ts} {msg}")
+        # Enforce max logs limit (remove oldest entries)
+        try:
+            max_logs = self.max_logs_input.value() if hasattr(self, 'max_logs_input') else self.config.get('max_logs', 500)
+            while self.log_widget.count() > int(max_logs):
+                self.log_widget.takeItem(0)
+        except Exception:
+            pass
+
+    def clear_logs(self):
+        """Clear the logs list widget."""
+        self.log_widget.clear()
 
     def select_src_directory(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Source Directory")
@@ -537,6 +615,16 @@ class BackupApp(QWidget):
             except Exception:
                 pass
 
+    def on_max_logs_changed(self, value):
+        try:
+            self.config["max_logs"] = int(value)
+            save_config(self.config)
+            # Trim existing logs if needed
+            while self.log_widget.count() > int(value):
+                self.log_widget.takeItem(0)
+        except Exception:
+            pass
+
     def apply_dark_mode(self, enabled):
         if enabled:
             # Simple dark stylesheet
@@ -579,7 +667,8 @@ class BackupApp(QWidget):
             self, dest, self.timeout_input.value(),
             src, self.filename_pattern_input.text(),
             self.date_folder_checkbox.isChecked(),
-            screenshot_offset=self.screenshot_offset_input.value()
+            screenshot_offset=self.screenshot_offset_input.value(),
+            watch_filename_changes=self.watch_filename_change_checkbox.isChecked()
         )
         self.handler.backup_done.connect(self.add_backup_to_table)
         self.watcher_thread = WatcherThread(self.handler, src)
@@ -594,7 +683,9 @@ class BackupApp(QWidget):
             "timeout": self.timeout_input.value(),
             "keep_on_top": True,
             "dark_mode": self.dark_mode_checkbox.isChecked(),
+            "watch_filename_changes": self.watch_filename_change_checkbox.isChecked(),
             "num_previous_backups": self.num_previous_backups_input.value(),
+            "max_logs": self.max_logs_input.value(),
             "screenshot_offset": self.screenshot_offset_input.value()
         })
 
@@ -639,7 +730,17 @@ class BackupApp(QWidget):
         # Example backup basename: "save1.sav_23-10-2025_12-00-00" -> original "save1.sav"
         base_backup = os.path.basename(backup_path)
         original_basename = re.sub(r'_\d{2}-\d{2}-\d{4}_\d{2}-\d{2}-\d{2}$', '', base_backup)
-        original_path = os.path.join(source_dir, original_basename)
+        # If the backup is a directory that matches the source directory's basename,
+        # restore its contents directly into the source directory (don't create a nested folder).
+        try:
+            src_basename = os.path.basename(source_dir.rstrip('/\\'))
+        except Exception:
+            src_basename = os.path.basename(source_dir)
+
+        if os.path.isdir(backup_path) and original_basename == src_basename:
+            original_path = source_dir
+        else:
+            original_path = os.path.join(source_dir, original_basename)
 
         # --- Stop watcher before restoring ---
         watcher_was_running = False
