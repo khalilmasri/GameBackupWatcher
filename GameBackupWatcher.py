@@ -16,6 +16,7 @@ from PIL import ImageGrab
 
 # ---------------- Global ---------------- #
 g_stop_watching = False
+g_version = "2.1.0"
 
 # ---------------- Config ---------------- #
 def get_config_file_path():
@@ -111,21 +112,19 @@ class BackupHandler(QObject, FileSystemEventHandler):
         # map of target file -> last known mtime to detect changes
         self._prev_mtimes = {}
         self.stop_requested = False
-        # initialize previous mtime for literal filename patterns (search anywhere under src_dir)
-        if self.watch_filename_changes:
-            is_literal = not any(c in self.filename_pattern for c in ['*', '?', '['])
-            if is_literal and os.path.isdir(self.src_dir):
-                try:
-                    for root, _, files in os.walk(self.src_dir):
-                        for f in files:
-                            if f == self.filename_pattern:
-                                p = os.path.join(root, f)
-                                try:
-                                    self._prev_mtimes[p] = os.path.getmtime(p)
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+        # initialize previous mtime for all matching files (literal or wildcard patterns)
+        if self.watch_filename_changes and os.path.isdir(self.src_dir):
+            try:
+                for root, _, files in os.walk(self.src_dir):
+                    for f in files:
+                        if fnmatch.fnmatch(f, self.filename_pattern):
+                            p = os.path.join(root, f)
+                            try:
+                                self._prev_mtimes[p] = os.path.getmtime(p)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
     def wait_for_next_timeout(self):
         global g_stop_watching
@@ -173,9 +172,8 @@ class BackupHandler(QObject, FileSystemEventHandler):
             return
         basename = os.path.basename(event.src_path)
         if fnmatch.fnmatch(basename, self.filename_pattern):
-            # If configured to watch a specific filename for changes and the pattern is a literal filename
-            is_literal = not any(c in self.filename_pattern for c in ['*', '?', '['])
-            if self.watch_filename_changes and is_literal:
+            # If configured to watch for filename changes, trigger full-source backup when a matching file changes
+            if self.watch_filename_changes:
                 # Use the actual event path as the target (handles files in subfolders)
                 target_path = event.src_path
                 try:
@@ -285,7 +283,8 @@ class WatcherThread(threading.Thread):
 class BackupApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Backup Manager")
+        global g_version
+        self.setWindowTitle(f"Backup Manager: v{g_version}")
         self.resize(1100, 600)
 
         self.config = load_config()
